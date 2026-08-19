@@ -1,0 +1,25 @@
+{
+  "name": "dsh-hypatia",
+  "version": "0.1.0",
+  "description": "Hypatia skills for DeepSeek Harness: knowledge-graph query skill plus automatic conversation-memory bridge. Requires the `hypatia` CLI on PATH.",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh-plugin",
+    "hypatia",
+    "memory",
+    "knowledge-graph"
+  ],
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "skills",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
