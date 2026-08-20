@@ -1,26 +1,28 @@
 # dsh-hypatia
 
-[Hypatia](https://github.com/MarchLiu/hypatia) memory plugin for DeepSeek Harness：为 DSH 会话接入 hypatia 本地知识图谱，让 agent 获得**跨会话的长期记忆**。
+[中文文档](./README.zh.md)
 
-装上之后你会得到：
+[Hypatia](https://github.com/MarchLiu/hypatia) memory plugin for DeepSeek Harness: connects DSH sessions to the hypatia local knowledge graph, giving agents **long-term memory across sessions**.
 
-- **自动记忆**：每一轮对话自动记入知识图谱，超长对话按层级自动摘要压缩，不撑爆上下文
-- **项目规则/禁忌自动加载**：新会话启动时自动加载当前项目与全局的 rule / taboo，agent 从第一轮就遵守你的项目约定
-- **语义沉淀**：自动从完成的讨论中提取 work unit（技术决策、踩坑修正链、设计方案），下次相关话题自动召回
-- **显式控制**：随时对 agent 说「记住…」「忘记…」直接读写记忆；提到知识库/记忆类话题会触发 `hypatia` skill 做图查询
+What you get:
 
-## 前置依赖
+- **Automatic memory** — every conversation turn is logged to the knowledge graph; oversized conversations are compressed through hierarchical summaries instead of blowing up the context
+- **Project rules/taboos auto-loaded** — new sessions load the current project's and global rules/taboos at startup, so the agent follows your project conventions from the very first turn
+- **Semantic distillation** — completed discussions are mined for work units (technical decisions, correction chains, design rationales) that resurface when related topics come up
+- **Explicit control** — tell the agent "remember …" / "forget …" anytime to read and write memory directly; knowledge-graph questions trigger the `hypatia` skill
 
-**系统本地必须安装 `hypatia` 命令（在 PATH 上）**。插件加载时探测 `hypatia --version`，缺失则打印警告并完全不注册（skills 与记忆桥接都不生效），安装 hypatia 后重启 dsh 即可。
+## Prerequisites
 
-从源码安装 hypatia：
+**The `hypatia` command must be installed on your PATH.** The plugin probes `hypatia --version` at load time; if it is missing, a warning is logged and nothing is registered (neither skills nor the memory bridge). Install hypatia and restart dsh to enable.
+
+Install hypatia from source:
 
 ```sh
 git clone https://github.com/MarchLiu/hypatia
 cd hypatia && cargo build --release
-# 将 target/release/hypatia 放入 PATH
+# put target/release/hypatia on your PATH
 
-# 可选：下载 BGE-M3 embedding 模型（向量搜索 / similar 召回需要）
+# Optional: download the BGE-M3 embedding model (required for vector search / similar recall)
 mkdir -p ~/.hypatia/default
 hf download BAAI/bge-m3 --local-dir /tmp/bge-m3
 cp /tmp/bge-m3/onnx/model.onnx ~/.hypatia/default/embedding_model.onnx
@@ -28,99 +30,99 @@ cp /tmp/bge-m3/onnx/model.onnx_data ~/.hypatia/default/model.onnx_data
 cp /tmp/bge-m3/onnx/tokenizer.json ~/.hypatia/default/tokenizer.json
 ```
 
-## 安装
+## Installation
 
 ```sh
-# 本地路径（开发或源码 checkout）
+# From a local path (development or source checkout)
 dsh plugin --profile web add /path/to/dsh-hypatia
 
-# 直接从 GitHub（纯 JS 无构建步骤，可直接安装）
+# Straight from GitHub (plain JS, no build step)
 dsh plugin --profile web add github:tkliuxing/dsh-hypatia
 
-# 从源码 checkout 运行 dsh 时，用 pnpm dsh 代替 dsh：
+# When running dsh from a source checkout, use pnpm dsh instead:
 pnpm dsh plugin --profile web add /path/to/dsh-hypatia
 ```
 
-安装后**重启 dsh** 生效。
+**Restart dsh** after installation.
 
-## 使用方式
+## Usage
 
-**无需任何手动操作**——记忆桥接是全自动的：每条消息自动记录、每 5 条用户消息自动检查是否有可提取的记忆、新会话自动加载规则。
+**No manual steps required** — the memory bridge is fully automatic: every message is logged, every 5 user messages trigger a check for extractable memories, and new sessions load rules at startup.
 
-在此之上，你可以：
+On top of that, you can:
 
-| 做法 | 效果 |
+| Action | Effect |
 |---|---|
-| 对 agent 说「记住：本项目禁用 eval」 | 显式写入一条记忆（rule / taboo / memory） |
-| 对 agent 说「忘掉关于 X 的记忆」 | 搜索并删除相关知识与关系 |
-| 问「知识库里关于 Y 有什么」「搜一下之前的决策」 | 触发 `hypatia` skill 做 JSE / 全文 / 向量查询 |
+| Tell the agent "remember: this project forbids eval" | Explicitly stores a memory (rule / taboo / memory) |
+| Tell the agent "forget what you know about X" | Searches and deletes the related knowledge and relationships |
+| Ask "what does the knowledge base say about Y", "search earlier decisions" | Triggers the `hypatia` skill for JSE / full-text / vector queries |
 
-## 验证
+## Verification
 
-配置层（应看到 `# == dsh-hypatia` 层）：
+Config layer (you should see a `# == dsh-hypatia` layer):
 
 ```sh
 dsh --profile web --dump-config
 ```
 
-端到端（确认 skill 与桥接真正工作）：
+End-to-end (confirm the skills and bridge actually work):
 
-1. 打开一个**新会话**——第一条注入消息应是 `[hypatia-memory] TRIGGER:session-start`
-2. 在该项目里随便聊几句后问 agent：「搜索知识库里的 message 条目」——应触发 `hypatia` skill 并返回已记录的对话
+1. Open a **new session** — the first injected message should be `[hypatia-memory] TRIGGER:session-start`
+2. Chat a bit in that project, then ask the agent: "search the knowledge base for message entries" — the `hypatia` skill should trigger and return the logged conversation
 
-## 升级与卸载
+## Upgrade and Removal
 
-`dsh plugin` 是 pnpm 转发器，升级与卸载同样在 profile 上操作，之后重启 dsh：
+`dsh plugin` is a pnpm forwarder; upgrade and removal run on the same profile, followed by a dsh restart:
 
 ```sh
-dsh plugin --profile web update dsh-hypatia   # 升级
-dsh plugin --profile web remove dsh-hypatia   # 卸载
+dsh plugin --profile web update dsh-hypatia   # upgrade
+dsh plugin --profile web remove dsh-hypatia   # remove
 ```
 
-## 包含内容
+## Contents
 
-| Skill | 说明 |
+| Skill | Description |
 |---|---|
-| `hypatia` | 用自然语言操作 hypatia 知识图谱：knowledge CRUD、RDF 三元组、JSE 查询、全文/向量搜索、shelf 管理 |
-| `hypatia-memory` | 自动记忆系统：逐条记录会话消息、分层摘要级联、work unit 语义提取、rules/taboos 加载 |
+| `hypatia` | Operate the hypatia knowledge graph in natural language: knowledge CRUD, RDF triples, JSE queries, full-text/vector search, shelf management |
+| `hypatia-memory` | Automatic memory system: per-turn conversation logging, hierarchical summary cascade, work-unit extraction, rules/taboos loading |
 
-### 事件桥接（hypatia-memory 的 TRIGGER 来源）
+### Event bridge (the TRIGGER source for hypatia-memory)
 
-`hypatia-memory` 原本依赖 Claude Code hooks（`UserPromptSubmit` / `Stop`）输出 TRIGGER 信号。本插件用原生 cordis 事件实现了等价桥接：
+`hypatia-memory` was designed around Claude Code hooks (`UserPromptSubmit` / `Stop`) emitting TRIGGER signals. This plugin implements an equivalent bridge using native cordis events:
 
-| DSH 事件 | 触发信号 |
+| DSH event | Trigger signal |
 |---|---|
-| `agent/session-start` | `TRIGGER:session-start` —— 加载项目与全局 rules/taboos |
-| `agent/pre-step`（含真实用户消息的 turn 第 1 步） | `TRIGGER:log`；每 5 条用户消息追加 `TRIGGER:extract`；检测到“记住/忘记”意图追加 `TRIGGER:immediate` |
-| `agent/turn-stopping` | `TRIGGER:log（assistant）` —— 记录助手回复（排队到下一 pre-step 生效） |
+| `agent/session-start` | `TRIGGER:session-start` — load project and global rules/taboos |
+| `agent/pre-step` (step 1 of a turn carrying a genuine user message) | `TRIGGER:log`; every 5 user messages appends `TRIGGER:extract`; remember/forget intent appends `TRIGGER:immediate` |
+| `agent/turn-stopping` | `TRIGGER:log (assistant)` — log the assistant reply (queued until the next pre-step) |
 
-桥接只作用于根会话（跳过 subagent 子会话）。
+The bridge only applies to root sessions (subagent child sessions are skipped).
 
-## 配置
+## Configuration
 
-在 cordis 行上可覆盖（均可选）：
+Everything is optional; override on the cordis row:
 
 ```yaml
 - insert:
     - id: dsh-hypatia
       name: 'dsh-hypatia'
       config:
-        memoryBridge: true    # 事件桥接开关（默认 true）
-        registerSkills: true  # skill 注册开关（默认 true）
-        extractInterval: 5    # 每 N 条用户消息触发一次 TRIGGER:extract（默认 5）
+        memoryBridge: true    # event bridge on/off (default true)
+        registerSkills: true  # skill registration on/off (default true)
+        extractInterval: 5    # user messages between TRIGGER:extract (default 5)
 ```
 
-## 已知限制
+## Known Limitations
 
-- **无 `TRIGGER:session-end`**：DSH 没有可靠的“会话结束”执行时机；会话恢复时摘要与 TURN 计数靠 skill 协议中的查询自行续接
-- **改动需重启**：skill 注册与事件桥接都在插件加载时执行，改动 `index.js` 或 `skills/` 后须重启 dsh
-- **向量搜索依赖 embedding 模型**：未下载模型时 `similar` 召回不可用，其余功能不受影响
+- **No `TRIGGER:session-end`**: DSH has no reliable "session end" execution point; on session resume, summaries and TURN counters continue via the skill protocol's own queries
+- **Changes require a restart**: skill registration and the event bridge run at plugin load time — restart dsh after editing `index.js` or `skills/`
+- **Vector search needs the embedding model**: without the downloaded model, `similar` recall is unavailable; everything else is unaffected
 
-## 开发
+## Development
 
-`skills/` 由本仓库自维护（曾与 hypatia 仓库同步，现已脱钩），直接编辑 `skills/*/SKILL.md` 即可，勿再从上游覆盖同步。
+`skills/` is self-maintained in this repository (it was once synced from the hypatia repo; the two are now decoupled). Edit `skills/*/SKILL.md` directly — do not overwrite-sync from upstream.
 
-以本地 link 安装（`dsh plugin add <路径>`）时改动 `index.js` 或 `skills/` 后重启 dsh 即生效。
+With a local link install (`dsh plugin add <path>`), changes to `index.js` or `skills/` take effect after restarting dsh.
 
 ## License
 
