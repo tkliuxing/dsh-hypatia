@@ -254,7 +254,7 @@ function registerMemoryBridge(ctx, { extractInterval }) {
 export function apply(ctx, config = {}) {
   if (!hypatiaAvailable()) {
     warn(ctx, '`hypatia` CLI not found on PATH — skills and memory bridge disabled. '
-      + 'Install hypatia (https://github.com/tkliuxing/hypatia) and restart dsh to enable.')
+      + 'Install hypatia (https://github.com/MarchLiu/hypatia) and restart dsh to enable.')
     return
   }
   if (config.registerSkills !== false) registerSkills(ctx)

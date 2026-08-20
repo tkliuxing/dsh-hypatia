@@ -1,6 +1,6 @@
 # dsh-hypatia
 
-[Hypatia](https://github.com/tkliuxing/hypatia) memory plugin for DeepSeek Harness：为 DSH 会话接入 hypatia 本地知识图谱，让 agent 获得**跨会话的长期记忆**。
+[Hypatia](https://github.com/MarchLiu/hypatia) memory plugin for DeepSeek Harness：为 DSH 会话接入 hypatia 本地知识图谱，让 agent 获得**跨会话的长期记忆**。
 
 装上之后你会得到：
 
@@ -16,7 +16,7 @@
 从源码安装 hypatia：
 
 ```sh
-git clone https://github.com/tkliuxing/hypatia
+git clone https://github.com/MarchLiu/hypatia
 cd hypatia && cargo build --release
 # 将 target/release/hypatia 放入 PATH
 
