@@ -18,6 +18,9 @@
     "README.md",
     "README.zh.md"
   ],
+  "scripts": {
+    "test": "node --test tests/**/*.spec.js"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

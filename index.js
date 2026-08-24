@@ -11,6 +11,11 @@
  *                               + TRIGGER:immediate on remember/forget intent)
  *   - agent/turn-stopping   -> TRIGGER:log for the assistant reply
  *
+ * The memory bridge only runs for sessions whose effective file-sandbox mode
+ * is `danger-full-access`, because hypatia's DuckDB lives outside the session
+ * workspace (typically `~/.hypatia/default`). Read-only and workspace-write
+ * sessions are silently skipped (one warning per session).
+ *
  * The plugin requires the `hypatia` CLI on PATH. When it is missing the
  * plugin logs a warning and registers nothing.
  *
@@ -125,6 +130,17 @@ function isRootSession(agent) {
 }
 
 /**
+ * Resolve the effective file-sandbox mode for an agent's session.
+ * Returns `undefined` only when no sandbox policy service is composed (legacy
+ * or test deployments). Resolution failures propagate so the gate can fail
+ * closed and report the error.
+ */
+function sessionSandboxMode(ctx, agent) {
+  const policy = ctx.get('sandboxPolicy')
+  return policy?.resolve({ session: agent.session }).mode
+}
+
+/**
  * One user-role plugin message. Mirrors `createUserMessage` from
  * `@deepseek-ai/dsh-llm` (`{ ...input, id: randomUUID(), role: 'user' }`),
  * inlined so this package needs no runtime dependency on harness packages —
@@ -140,7 +156,7 @@ function pluginMessage(text, summary) {
   }
 }
 
-/** Extract plain text from a user/message event's content blocks. */
+/** Extract plain text from a user message's content blocks. */
 function messageText(message) {
   return (message.content ?? [])
     .filter((block) => block.type === 'text')
@@ -150,10 +166,19 @@ function messageText(message) {
 
 /**
  * Register the hypatia-memory event bridge for the lifetime of `ctx`.
+ *
+ * The bridge is gated by the session's effective file-sandbox mode: it only
+ * injects TRIGGER signals when the mode is `danger-full-access`, because the
+ * triggered skill runs `hypatia` commands that read/write the hypatia DuckDB
+ * outside the workspace. Confined sessions are skipped with a one-time warning.
+ *
+ * Startup initialization is tracked independently: if a session begins in a
+ * confined mode and is later elevated to `danger-full-access`, the missed
+ * `TRIGGER:session-start` is injected at the first full-access opportunity.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {{ extractInterval: number }} options
  */
-function registerMemoryBridge(ctx, { extractInterval }) {
+export function registerMemoryBridge(ctx, { extractInterval }) {
   /** Per-session bridge state. */
   const states = new Map()
   const stateFor = (id) => {
@@ -164,42 +189,96 @@ function registerMemoryBridge(ctx, { extractInterval }) {
     }
     return state
   }
-  ctx.on('agent/disposed', ({ agent }) => {
-    states.delete(String(agent.session.id))
-  })
 
-  // Claude Code `SessionStart` equivalent: ask the model to load project and
-  // global rules/taboos before the first turn.
-  ctx.on('agent/session-start', ({ agent }) => {
-    if (!isRootSession(agent)) return
+  /**
+   * Sessions already warned about confined mode, so we log the skip reason
+   * only once per session.
+   */
+  const warnedSessions = new Set()
+  const warnSkippedOnce = (agent, action, reason) => {
     const sessionId = String(agent.session.id)
+    if (warnedSessions.has(sessionId)) return
+    warnedSessions.add(sessionId)
+    warn(ctx, `hypatia-memory ${action} skipped for session ${sessionId}: ${reason}`)
+  }
+
+  /**
+   * Sessions whose startup trigger has already been injected. Tracked
+   * separately so a session created confined and later elevated still gets
+   * its rules/taboos loaded and its turn counter restored.
+   */
+  const startupInjected = new Set()
+  const buildStartupMessage = (agent) => {
+    const sessionId = String(agent.session.id)
+    if (startupInjected.has(sessionId)) return undefined
+    startupInjected.add(sessionId)
     const project = projectOf(agent)
-    agent.inject(pluginMessage(
+    return pluginMessage(
       `[hypatia-memory] TRIGGER:session-start\n`
       + `SESSION_ID: ${sessionId}，PROJECT: ${project}\n`
       + `请通过 skill 工具加载 hypatia-memory 并执行 Session Startup：查询并内化 PROJECT=${project} `
       + `与全局 scope 的 rule / taboo 知识条目。若已存在 msg-${sessionId}-* 条目（会话恢复），`
       + `TURN 计数从现有最大序号继续。本会话后续的 [hypatia-memory] TRIGGER 信号均按该 skill 的协议处理。`,
       'hypatia-memory：会话启动，加载 rules/taboos',
-    ))
+    )
+  }
+
+  /**
+   * Common gate for every bridge event: confined sessions warn once and are
+   * skipped; full-access sessions are allowed through. Startup injection is
+   * handled by each caller so that pre-step can place the startup message in
+   * the same decision before the log notice (agent.inject() during pre-step
+   * would queue it for the next step).
+   */
+  const guardAccess = (agent, action) => {
+    let mode
+    try {
+      mode = sessionSandboxMode(ctx, agent)
+    } catch (error) {
+      warnSkippedOnce(
+        agent,
+        action,
+        `sandbox policy resolution failed (${String(error)}); danger-full-access was not confirmed.`,
+      )
+      return false
+    }
+    // No sandbox policy service composed: treat as unrestricted (legacy / test).
+    if (mode === undefined || mode === 'danger-full-access') return true
+    warnSkippedOnce(
+      agent,
+      action,
+      `sandbox mode "${mode}" cannot access the hypatia DuckDB (requires danger-full-access).`,
+    )
+    return false
+  }
+
+  ctx.on('agent/disposed', ({ agent }) => {
+    states.delete(String(agent.session.id))
+    warnedSessions.delete(String(agent.session.id))
+    startupInjected.delete(String(agent.session.id))
+  })
+
+  // Claude Code `SessionStart` equivalent: ask the model to load project and
+  // global rules/taboos before the first turn.
+  ctx.on('agent/session-start', ({ agent }) => {
+    if (!isRootSession(agent)) return
+    if (!guardAccess(agent, 'session-start')) return
+    const startup = buildStartupMessage(agent)
+    if (startup) agent.inject(startup)
   })
 
   // Claude Code `UserPromptSubmit` equivalent: fire on the first step of a
   // turn that carries a genuine user message.
-  ctx.on('agent/pre-step', async ({ agent, turn, step, signal }, next) => {
+  ctx.on('agent/pre-step', async ({ agent, messages, turn, step, signal }, next) => {
     const decision = await next()
     if (decision.kind === 'reject' || signal.aborted) return decision
     if (step !== 1 || !isRootSession(agent)) return decision
+    if (!guardAccess(agent, 'pre-step')) return decision
 
-    const events = agent.session.events
-    const start = events.findLastIndex(
-      (event) => event.type === 'turn/start' && event.data.turn === turn,
-    )
-    if (start < 0) return decision
-    const userEvent = events
-      .slice(start + 1)
-      .find((event) => event.type === 'user/message' && event.data.source.kind === 'user')
-    if (!userEvent) return decision
+    // Claimed inbox messages are not appended to session.events until after
+    // pre-step returns, so the direct prompt must be found in this payload.
+    const userMessage = messages.find((message) => message.source.kind === 'user')
+    if (!userMessage) return decision
 
     const sessionId = String(agent.session.id)
     const state = stateFor(sessionId)
@@ -207,6 +286,8 @@ function registerMemoryBridge(ctx, { extractInterval }) {
     state.countedTurns.add(turn)
     state.userTurns += 1
 
+    // Claim startup only once it can be returned with a genuine user prompt.
+    const startup = buildStartupMessage(agent)
     const project = projectOf(agent)
     const lines = [
       `[hypatia-memory] TRIGGER:log`,
@@ -219,7 +300,7 @@ function registerMemoryBridge(ctx, { extractInterval }) {
         `TRIGGER:extract —— 同时检查最近对话中是否有已完成的 work unit 需要提取为语义记忆。`,
       )
     }
-    if (EXPLICIT_MEMORY_RE.test(messageText(userEvent.data))) {
+    if (EXPLICIT_MEMORY_RE.test(messageText(userMessage))) {
       lines.push(
         `TRIGGER:immediate —— 用户消息疑似包含显式“记住/忘记”请求，若确认请直接执行对应的语义记忆操作。`,
       )
@@ -228,6 +309,7 @@ function registerMemoryBridge(ctx, { extractInterval }) {
       kind: 'enter',
       messages: [
         ...decision.messages,
+        ...(startup ? [startup] : []),
         pluginMessage(lines.join('\n'), 'hypatia-memory：记录用户消息'),
       ],
     }
@@ -237,6 +319,7 @@ function registerMemoryBridge(ctx, { extractInterval }) {
   // pending context is claimed at the next pre-step (or after resume).
   ctx.on('agent/turn-stopping', ({ agent }) => {
     if (!isRootSession(agent)) return
+    if (!guardAccess(agent, 'turn-stopping')) return
     const sessionId = String(agent.session.id)
     const state = states.get(sessionId)
     if (!state || state.userTurns === 0) return
