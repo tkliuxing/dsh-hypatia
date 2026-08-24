@@ -2,11 +2,13 @@
 
 ## Status
 
-Architecture research completed. The target architecture is approved in stages, not as a single cutover.
+Architecture research is complete. This revision applies a hard repository boundary:
 
-- **GO now:** DSH as the canonical conversation source, a host-managed Hypatia stdio sidecar, and bounded read-only recall.
-- **Conditional GO:** explicit semantic writes, compaction-summary ingestion, and model-assisted extraction after provenance, idempotency, repair, deletion, and authorization requirements are implemented.
-- **NO-GO by default:** full-transcript vector mirroring.
+- **Only this repository may be changed.**
+- DeepSeek Harness and Hypatia are external dependencies and must remain unmodified.
+- The first implementation uses a host-side, one-shot Hypatia CLI adapter plus a plugin-owned SQLite control ledger.
+- An in-repository Rust helper is only a benchmark-triggered fallback and requires a separate design discussion before implementation.
+- Full-transcript vector mirroring remains **NO-GO by default**.
 
 ## Goal
 
@@ -14,48 +16,73 @@ Build `dsh-hypatia` as a reliable, scoped, auditable long-term memory capability
 
 The intended ownership split is:
 
-- DSH session persistence is the source of truth for raw conversation history.
-- Hypatia stores derived semantic memories, summaries, user-confirmed rules and taboos, graph relationships, and provenance pointing back to DSH events.
-- The DSH plugin owns lifecycle integration, memory authorization, scope derivation, recall budgets, extraction scheduling, validation, and observability.
-- A persistent Hypatia sidecar owns storage connections, embedding state, mutation journals, idempotent receipts, repair, and deletion state.
+- DSH session persistence remains the source of truth for raw conversation history.
+- The plugin owns lifecycle integration, memory authorization, durable operation state, scope derivation, provenance, recall budgets, extraction scheduling, validation, retries, and observability.
+- Hypatia remains an unmodified external semantic/graph storage and query backend reached through its installed CLI.
+- The plugin-owned control ledger is the canonical control plane for plugin-created semantic memories and their delivery state; it is not a second raw transcript store.
 - Models may propose semantic content, but never determine storage authority, source provenance, project scope, destructive target sets, or commit success.
+
+## Hard Constraints
+
+This goal must be implemented entirely in `dsh-hypatia`.
+
+Do not:
+
+- Modify DeepSeek Harness packages or require new DSH lifecycle hooks.
+- Modify Hypatia library, CLI, schema, query operators, storage implementation, or release process.
+- Patch or vendor Hypatia source into this repository.
+- Depend on a hypothetical Hypatia daemon, JSONL protocol, batch API, transaction, tombstone, or idempotency API.
+- Write DuckDB or Hypatia's SQLite index directly from Node.
+- Use Agent Bash or `danger-full-access` as the automatic memory data plane.
+- Claim storage guarantees that the current Hypatia CLI cannot provide.
+
+The implementation may use:
+
+- Existing DSH plugin lifecycle, session-query, tool, LLM, and context APIs.
+- Node.js standard-library APIs supported by the DSH runtime, including `node:sqlite`, `child_process.execFile`, `AbortSignal`, and filesystem primitives.
+- The installed, unmodified `hypatia` CLI.
+- Plugin-owned state under a configurable directory such as `~/.dsh/dsh-hypatia/`.
+
+Any proposal to add an in-repository Rust helper, native dependency, or bundled executable is a large implementation change and must be discussed with the user before work begins.
 
 ## Architecture Decision
 
-Use a **single-threaded, host-managed stdio JSONL sidecar** that keeps one explicit Hypatia shelf, its DuckDB/SQLite connections, and its embedding provider open.
+Use a **host-trusted CLI adapter backed by a plugin-owned SQLite control ledger**.
 
 ```text
 DSH durable session log
         |
-        | turn/end notification + durable suffix/cursor read
+        | turn/end notification + live-preferred durable read
         v
-DSH Hypatia host plugin
+dsh-hypatia host plugin
   - memory authorization
   - project/scope derivation
   - provenance and stable operation IDs
-  - recall deadline and context budget
-  - extraction scheduling and validation
+  - node:sqlite control ledger and outbox
+  - recall cache, deadline, and context budget
+  - extraction scheduling and proposal validation
         |
-        | versioned JSONL requests and receipts
+        | execFile(absoluteHypatiaPath, fixedArgv)
         v
-Hypatia sidecar
-  - one explicit shelf and one writer
-  - persistent Lab/connections/embedder
-  - operation journal and idempotency
-  - DuckDB primary semantic records
-  - repairable FTS and embedding indexes
-  - tombstones and deletion cleanup
+Unmodified Hypatia CLI
+  - knowledge and statement CRUD
+  - JSE / FTS / vector queries
+  - existing shelves, DuckDB, SQLite FTS, embeddings
 ```
 
-Do not use the following as the automatic memory data plane:
+The adapter is host code, not a model-facing shell command. It intentionally runs outside the Agent file sandbox in the same way other trusted host persistence capabilities do. Memory access is governed by an independent plugin policy.
 
-- Primary-model `TRIGGER + skill + Bash` orchestration.
-- One-shot Hypatia CLI invocations on every turn.
-- Direct Node writes to DuckDB.
-- MCP tools for automatic ingestion.
-- `danger-full-access` as memory consent.
+### Why this route
 
-N-API may be reconsidered after the storage and protocol contracts stabilize. HTTP or a Unix socket may replace stdio only if multiple independent clients need to share one daemon.
+This route accepts several constraints in exchange for keeping all changes local to this repository:
+
+- Every Hypatia CLI call creates a new `Lab`, restores registered shelves, and reopens storage.
+- SQLite FTS currently rebuilds on open.
+- Write commands do not return stable machine receipts.
+- DuckDB, SQLite FTS, and embedding updates are not atomic together.
+- Vector search has no exact project filter before top-K ranking.
+
+The plugin compensates where it can through a durable ledger, stable names, post-write verification, serialization, caching, retry, and exact host-side visibility checks. It must expose remaining limitations instead of pretending they are solved.
 
 ## Established Facts
 
@@ -65,8 +92,8 @@ N-API may be reconsidered after the storage and protocol contracts stabilize. HT
 - Messages returned by the accepted pre-step decision are appended as durable `user/message` events and enter the same model request.
 - `agent/turn-stopping` occurs after the response and cannot affect the request that just completed. Steering there creates another step.
 - `session/event` is post-commit to the live in-memory log, fire-and-forget, and not an external durability barrier.
-- `session/flush` is the explicit durability barrier and is used before LLM and top-level tool side effects. Hypatia network or embedding work must not participate in this barrier by default.
-- Seeded events loaded during resume or fork do not re-emit through `session/event`; consumers need durable cursor reconciliation.
+- `session/flush` is the explicit DSH durability barrier. Hypatia CLI work must not participate in it by default.
+- Seeded events loaded during resume or fork do not re-emit through `session/event`; consumers need cursor reconciliation.
 - A closed `turn/end` is the minimum stable source boundary for semantic extraction.
 
 Primary evidence:
@@ -90,7 +117,7 @@ DSH already provides:
 - A proven same-request recall pattern in the session-reference plugin.
 - Auxiliary LLM call patterns in the session-title provider.
 
-Therefore Hypatia should not become a second canonical transcript store by default.
+Therefore Hypatia must not become a second canonical raw transcript store by default.
 
 Primary evidence:
 
@@ -100,27 +127,135 @@ Primary evidence:
 - `../deepseek-harness/packages/context/session-reference/src/index.ts:106-147`
 - `../deepseek-harness/packages/session/session-title-llm/src/index.ts:229-279`
 
-### Hypatia constraints
+### Current Hypatia constraints
+
+The plugin must design around these upstream facts without changing them:
 
 - Every CLI invocation constructs a new `Lab` and restores registered shelves.
 - Each opened shelf holds DuckDB, SQLite, and an embedding provider.
-- Storage objects intentionally do not implement `Send + Sync`; a single-threaded owner fits the current design.
-- SQLite currently drops and rebuilds its FTS table on every open.
+- SQLite drops and rebuilds its FTS table on every open.
 - Knowledge and statement writes update DuckDB, SQLite FTS, and embeddings sequentially without a cross-store transaction or repair journal.
 - Vector similarity search scans globally and lacks a storage-level exact project/scope filter.
-- The CLI has mixed human-readable and JSON output and no stable request/receipt envelope.
+- CLI output is mixed: reads are often JSON, while writes and administration use human-readable text.
 - There is no daemon, batch mutation contract, caller idempotency key, tombstone model, or provenance-indexed delete.
-- Shelf registry writes are not protected by an atomic replacement or cross-process lock.
+- The shelf registry lacks a cross-process lock and atomic replacement contract.
 
 Primary evidence:
 
 - `../hypatia/src/cli/commands.rs:197-207`
 - `../hypatia/src/storage/shelf_manager.rs:154-238`
-- `../hypatia/src/storage/mod.rs:1-20`
 - `../hypatia/src/storage/sqlite_store.rs:95-143`
 - `../hypatia/src/service/knowledge.rs:14-40`
 - `../hypatia/src/service/statement.rs:27-48`
 - `../hypatia/src/storage/duckdb_store.rs:378-443`
+
+## Plugin-Owned Control Ledger
+
+Use `node:sqlite` to maintain plugin state under a configurable host path, initially:
+
+```text
+~/.dsh/dsh-hypatia/state.sqlite
+```
+
+The ledger stores semantic-memory control data, not raw conversation transcripts.
+
+Minimum logical tables:
+
+```text
+memory_operation
+memory_record
+memory_provenance
+memory_relation
+memory_tombstone
+session_cursor
+retry_queue
+dead_letter
+```
+
+### Ledger responsibilities
+
+- Assign stable memory IDs and Hypatia names.
+- Persist operation intent before invoking Hypatia.
+- Persist exact semantic payloads needed for verification and replay.
+- Track source identity and sequence ranges.
+- Track pending, uncertain, applied, conflict, tombstoned, cleanup-pending, and failed states.
+- Serialize mutations by shelf.
+- Retry uncertain operations by stable operation ID.
+- Suppress tombstoned and wrong-scope records before any result reaches the model.
+- Reconcile ledger state against Hypatia after startup, timeout, crash, or ambiguous CLI output.
+- Retain bounded audit metadata without retaining deleted semantic content after cleanup.
+
+### Transaction boundary
+
+Keep SQLite transactions short. Never hold a ledger transaction open while a Hypatia process is running.
+
+One operation follows this state machine:
+
+```text
+ledger intent committed
+  -> Hypatia CLI invocation
+  -> Hypatia read-back verification
+  -> ledger receipt committed
+```
+
+If the process exits or times out after dispatch, mark the operation `uncertain`. Reconciliation determines whether the stable Hypatia key contains the expected payload before retrying.
+
+The plugin provides at-least-once delivery with idempotent wrapping. It does not claim an atomic transaction across DSH, the plugin ledger, DuckDB, SQLite FTS, and embeddings.
+
+## Hypatia CLI Adapter
+
+### Execution boundary
+
+The adapter must:
+
+- Resolve and retain one absolute Hypatia binary path during plugin startup.
+- Verify a supported version before enabling memory operations.
+- Invoke the binary with `execFile` or equivalent `shell: false` execution.
+- Construct fixed argv arrays; never interpolate shell command strings.
+- Apply an AbortSignal, timeout, stdout/stderr byte caps, and process termination policy.
+- Normalize exit status, signal, timeout, output overflow, JSON parse errors, and known human output into structured plugin errors.
+- Serialize mutations per shelf to reduce concurrent DuckDB/SQLite conflicts.
+- Apply bounded concurrency to reads.
+- Never expose generic CLI argv, paths, JSE, SQL, or shell text as model-controlled tool input.
+
+### Stable names
+
+Plugin-created records use host-generated names such as:
+
+```text
+dshmem:v1:<scopeHash>:<memoryId>
+dshsession:v1:<sessionIdentityHash>
+```
+
+The scope prefix is redundant with ledger metadata and enables deterministic ownership checks. A name collision with a different payload is a conflict, not a successful retry.
+
+Relations created by the plugin must also be recorded in the ledger with exact triples so cleanup never relies on a broad model-generated relationship query.
+
+### Write verification
+
+A successful CLI exit alone is not a durable receipt.
+
+For knowledge writes:
+
+1. Create or update by the host-generated stable name using available CLI operations.
+2. Read the exact knowledge name back.
+3. Compare the normalized payload or payload hash with the ledger intent.
+4. Mark the operation applied only after a match.
+
+For statement writes:
+
+1. Create the exact host-generated triple.
+2. Query the exact triple positions.
+3. Compare normalized content.
+4. Record each relation independently so partial fanout can be retried.
+
+If the key exists with different content, stop and mark a conflict. Do not overwrite unknown user-owned records.
+
+### Repair limitations
+
+The adapter may repair plugin-owned records by exact stable key, including delete-and-recreate when the ledger has the canonical semantic payload. It must not repair or rewrite arbitrary user-owned Hypatia knowledge.
+
+Without upstream changes, the plugin cannot prove that every Hypatia internal FTS/vector partial failure has converged. `memory_status` must report degraded or uncertain index state when verification is incomplete.
 
 ## DSH Plugin Responsibilities
 
@@ -129,15 +264,17 @@ Primary evidence:
 Use `session/event` and `turn/end` only as work notifications. The reliable consumer must:
 
 1. Persist a cursor containing source identity and `lastAppliedSeq`.
-2. Read a contiguous durable suffix after the target `turn/end`.
-3. Process only complete source ranges.
-4. Reconcile on startup, resume, and sidecar restart.
-5. Deliver work at least once and rely on idempotent Hypatia commits.
+2. Read a live-preferred, replay-validated session snapshot through existing DSH services.
+3. Process only source ranges closed by `turn/end`.
+4. Reconcile on startup, resume, and plugin reload.
+5. Enqueue semantic work in the local ledger before returning from the scheduling task.
 6. Exclude plugin recall messages and other derived memory context from re-ingestion.
 7. Process only child events at `seq >= seedLength` for forks by default.
 8. Skip subagent transcripts by default; allow an explicit parent-scoped digest later.
 
-Do not infer message contents from the current model context. Do not count turns only in an in-memory `Map`.
+If the required durable session-query/persistence service is unavailable, automatic extraction must remain disabled. The plugin may still expose explicit memory tools if its memory policy allows them.
+
+Do not infer message contents from current model context. Do not count turns only in an in-memory `Map`.
 
 ### Same-request recall
 
@@ -146,21 +283,39 @@ Implement recall in `agent/pre-step`:
 1. Call `await next()` and preserve downstream decisions.
 2. Return immediately on rejection.
 3. Build the query only from direct human messages in the original claimed payload.
-4. Derive project and namespace in host code.
-5. Query Hypatia with exact storage-level scope filtering.
-6. Optionally query DSH session-query for bounded lexical evidence from raw history.
-7. Merge, deduplicate, rank, and truncate results deterministically.
-8. Append a plugin message with `form: recall` to the accepted decision.
-9. Treat every recalled value as untrusted historical data, never as a permission or system-policy source.
-10. Fail open on timeout, cancellation, sidecar failure, or malformed output.
+4. Derive project and scope in host code.
+5. Read exact-scope plugin records from the ledger/cache.
+6. Optionally use DSH session-query for bounded lexical evidence from raw history.
+7. Optionally invoke Hypatia search/similar within the remaining deadline.
+8. Accept Hypatia candidates only when their stable key maps to an active exact-scope ledger record, unless the user explicitly invokes a broader Hypatia search tool.
+9. Merge, deduplicate, rank, and truncate results deterministically.
+10. Append a plugin message with `form: recall` to the accepted decision.
+11. Treat every recalled value as untrusted historical data, never as permission or system policy.
+12. Fail open on timeout, cancellation, adapter failure, or malformed output.
 
 Default recall limits:
 
-- Deadline: configurable, initially 100-300 ms.
+- Total deadline: configurable, initially 100-300 ms.
 - Results: at most 5 entries.
 - Injected payload: at most 8-12 KB and a configured token budget.
-- Vector recall: only if it finishes within the same deadline.
-- Rules/taboos: only user-confirmed, exact-scope records with provenance and trust state.
+- Ledger/cache lexical recall is the reliable baseline.
+- Hypatia vector recall is a best-effort supplement because current vector top-K cannot pre-filter by exact project scope.
+- Rules/taboos must be user-confirmed, exact-scope records with provenance and trust state.
+
+### Scope isolation
+
+Exact isolation is enforced by the plugin ledger and stable record prefix, not by assuming Hypatia's content-level `scopes` are sufficient.
+
+Automatic recall must never inject a Hypatia candidate unless:
+
+- the name has a recognized plugin-owned stable prefix;
+- the record exists and is active in the ledger;
+- the ledger scope exactly matches the current host-derived scope;
+- the record is not tombstoned, conflicted, or uncertain.
+
+Hypatia vector results may be adaptively over-fetched and then filtered, but this remains best effort and must not be the only automatic recall path.
+
+User-invoked generic Hypatia search is a separate, explicitly broader operation and must label results as untrusted external knowledge.
 
 ### Extraction
 
@@ -168,8 +323,8 @@ Roll extraction out conservatively:
 
 - First ingest existing DSH `compaction/summary` events; do not pay for a second summary of the same source range.
 - Support explicit remember operations through a narrow model-facing tool.
-- Add background work-unit extraction only after the mutation and deletion gates below pass.
-- Run extraction through a separately configured auxiliary LLM route, not by adding work to the primary response loop.
+- Add background work-unit extraction only after ledger, retry, verification, deletion, and authorization gates pass.
+- Use existing DSH LLM services through a separately configured auxiliary route; do not modify DSH.
 - Frame source messages as JSON data and require a versioned structured proposal.
 - Derive source range, project, scope, operation ID, and authorization in host code.
 - Apply host-side limits and redaction. A model claim that content is safe or redacted is not authoritative.
@@ -182,11 +337,11 @@ The model may propose:
 - Candidate tags.
 - Candidate graph relations within bounded fanout.
 
-The model may not propose authoritative:
+The model may not authoritatively propose:
 
 - Shelf or project identity.
 - Global scope.
-- Filesystem paths, URLs, shell commands, SQL, or JSE programs.
+- Filesystem paths, URLs, shell commands, SQL, JSE, or raw CLI argv.
 - A permission grant.
 - A destructive selector or delete target set.
 - A database success result.
@@ -200,11 +355,11 @@ Replace general Bash access with narrow tools:
 - `memory_forget_preview`
 - `memory_forget_confirm`
 - `memory_status`
-- `memory_reindex` for explicit administrative use
+- `memory_reconcile` for explicit administrative use
 
 Automatic recall must not depend on the model calling `memory_search`.
 
-Forget must be a two-stage exact-ID workflow. Broad semantic search may produce preview candidates, but only host-generated IDs from the preview may be confirmed. The first deletion action is a tombstone so the item immediately disappears from recall; physical cleanup is asynchronous and auditable.
+Forget is a two-stage exact-ID workflow. Broad semantic search may produce preview candidates, but only host-generated IDs from that preview may be confirmed.
 
 ## Memory Authorization
 
@@ -222,10 +377,11 @@ global-rule-write
 Rules:
 
 - Installing/enabling the host plugin grants only the configured host capability.
-- `read-only`, `workspace-write`, and `danger-full-access` remain file-effect policies, not memory consent.
-- Project scope is derived from a configured stable project ID or a hash of the canonical project root, not only `basename(cwd)`.
+- `read-only`, `workspace-write`, and `danger-full-access` remain Agent file-effect policies, not memory consent.
+- Automatic Hypatia CLI calls are host-trusted plugin effects and must be documented as such.
+- Project scope is derived from a configured stable project ID or hash of the canonical project root, not only `basename(cwd)`.
 - Global rule/taboo writes require explicit authorization and cannot be produced by automatic extraction.
-- Delete, export, archive, connect, and reindex are separate administrative capabilities.
+- Delete, export, archive, connect, and reconcile are separate administrative capabilities.
 - Model-provided or recalled text never changes authorization.
 
 ## Provenance and Identity
@@ -255,107 +411,54 @@ Every source-derived memory must contain at least:
 }
 ```
 
-The stable operation ID must be derived from immutable host-owned fields such as:
+The stable operation ID is derived from immutable host-owned fields:
 
 ```text
 source identity + fromSeq + throughSeq + memory kind
 + extractor version + proposal schema version
 ```
 
-A repeated operation ID must return the original durable receipt rather than creating another memory.
+A repeated operation ID returns the existing ledger receipt or enters reconciliation. It never blindly creates another Hypatia record.
 
-For forks, inherited events remain associated with the parent source. The child consumer starts at its `seedLength` unless a separate lineage operation explicitly links parent memory.
-
-## Hypatia Sidecar Contract
-
-### Process model
-
-- Add `hypatia serve --stdio --shelf <absolute-path>` or an equivalent dedicated binary.
-- Open only the configured shelf; do not restore every registry entry.
-- Acquire an exclusive writer lock for the shelf.
-- Keep `Lab`, DuckDB, SQLite, and the embedding provider alive.
-- Serialize storage mutations through one owner thread.
-- Keep stdout machine-only JSONL; send diagnostics to stderr.
-- Enforce request-line, response, queue-depth, and result-size limits.
-- Perform a protocol/schema/version handshake before accepting work.
-- Let Node restart the process with bounded backoff without restarting the DSH agent loop.
-
-### Minimum operations
-
-```text
-hello / health / status
-recall
-validateProposal
-commitProposal
-getReceipt
-deleteById
-deleteByProvenance
-repair
-shutdown
-```
-
-Every mutating request carries a stable caller-generated `opId`. A response is a durable receipt, not merely a report that execution started.
-
-If the child exits after a request is written but before a response arrives, the client must classify the result as `uncertain` and retry by the same `opId` after restart.
-
-### Consistency model
-
-Do not attempt a distributed transaction between DSH and Hypatia. Provide:
-
-- DSH-to-Hypatia at-least-once delivery.
-- Idempotent sidecar commits.
-- A durable source watermark.
-- A durable operation intent and receipt journal.
-- A read-side visibility gate.
-- Deterministic repair and rebuild.
-
-Treat DuckDB semantic entities as primary records. FTS and embeddings are repairable indexes with explicit status:
-
-```text
-pending -> ready
-pending -> failed -> retrying -> ready
-```
-
-Recall must exclude incomplete, validation-failed, and tombstoned records unless a specific degraded read mode says otherwise.
-
-A successful semantic commit may report `ftsPending` or `embeddingPending`; it must never leave the caller unable to determine whether the primary entity exists.
-
-### Scope filtering
-
-Exact namespace/project filtering must occur inside the storage query before ranking or top-K truncation. It is not acceptable to:
-
-1. search all shelves/projects;
-2. take global top-K;
-3. filter the returned rows in Node.
-
-Hypatia needs an indexed first-class scope/namespace representation or an equivalent exact filter usable by FTS and vector SQL.
+For forks, inherited events remain associated with the parent source. The child consumer starts at `seedLength` unless a separate lineage operation explicitly links parent memory.
 
 ## Deletion and Retention
 
-Deletion is part of the core design, not a later UI concern.
+Deletion is part of the plugin control design, but its guarantee must be scoped honestly.
 
-Required state:
+### Supported guarantee
+
+For plugin-owned semantic records in the active configured shelf:
+
+1. Authorize an exact host-generated memory ID.
+2. Write a durable deletion request to the ledger.
+3. Tombstone the record synchronously so plugin recall immediately stops returning it.
+4. Delete exact plugin-owned relations recorded in the ledger.
+5. Delete the exact Hypatia knowledge key through the CLI.
+6. Verify absence through exact reads/queries.
+7. Remove the semantic payload from the ledger after cleanup while retaining content-free audit metadata.
+8. Retry uncertain cleanup or expose it through `memory_status`.
+
+### Explicit limitations
+
+Without modifying Hypatia, this repository cannot guarantee erasure from:
+
+- Unknown user-created relations that refer to a deleted plugin record.
+- Hypatia exports or external backups not tracked by this plugin.
+- A stale internal FTS row after an upstream partial failure that the available CLI cannot repair safely.
+- Other clients or shelves not managed by this plugin.
+- DSH source transcripts and their persistence backups.
+
+The UI/tool response must distinguish:
 
 ```text
-memory_operation
-memory_provenance
-memory_tombstone
-memory_export_inventory
+tombstoned
+active-shelf-cleanup-complete
+cleanup-uncertain
+external-retention-unknown
 ```
 
-Deletion sequence:
-
-1. Authorize an exact host-generated target set.
-2. Write a durable deletion request.
-3. Tombstone targets synchronously so recall stops returning them.
-4. Remove or rewrite dependent relations and summaries.
-5. Remove DuckDB records, SQLite FTS rows, vectors, archives, and tracked exports according to policy.
-6. Record cleanup status and retry failures.
-7. Preserve an audit record that does not retain the deleted content itself.
-
-A source transcript deletion policy must separately define DSH retention, persistence backend deletion, backup retention, and how Hypatia handles provenance whose source is gone.
-
-Do not claim complete forget semantics until both DSH source retention and all Hypatia derived artifacts have explicit contracts.
+Do not claim complete or regulatory-grade forget semantics beyond the supported boundary.
 
 ## Prompt Injection and Privacy
 
@@ -374,75 +477,112 @@ Controls:
 - Delimit recall as historical reference data and strip it of execution authority.
 - Only user-confirmed rule/taboo records can influence behavior, and they remain user-level instructions.
 - Derive scope and authorization outside the model.
-- Apply deterministic payload, relation fanout, query, and result limits.
+- Apply deterministic payload, relation fanout, query, process-output, and result limits.
 - Run host-side sensitive-data classification/redaction before storage.
 - Do not store raw secrets merely because the model failed to identify them.
 - Exclude memory recall messages from future extraction to prevent recursive poisoning.
 - Keep full transcript mirroring disabled by default.
+- Delete semantic payloads from both Hypatia and the plugin ledger when cleanup succeeds.
+
+## Performance Decision Gate
+
+One-shot CLI latency is an accepted first-stage risk, not an ignored fact.
+
+Before enabling automatic same-request Hypatia vector recall by default, benchmark at representative sizes and concurrency:
+
+```text
+100, 1,000, and 10,000 plugin-owned semantic records
+1 and 4 concurrent DSH sessions
+cold and warm process/filesystem cache
+FTS, exact get, JSE, and vector similar
+```
+
+Initial acceptance targets:
+
+- Recall adapter P95 within the configured 300 ms deadline at the supported dataset size.
+- Timeout and cancellation leave no child process running.
+- Output caps hold under large query results.
+- Concurrent operations produce no observable shelf corruption or registry drift.
+- Normal user turns continue when every Hypatia call fails.
+
+If the CLI adapter misses the agreed target, the next step is a design discussion, not an automatic implementation change.
+
+The fallback may be an in-repository Rust helper that depends on Hypatia's public library and exposes a private JSONL protocol while keeping `Lab` alive. That option:
+
+- still does not modify Hypatia;
+- introduces native builds and cross-platform packaging;
+- may inherit Hypatia's multi-store consistency limitations;
+- requires explicit user approval and a separate GOAL amendment before implementation.
+
+Do not introduce N-API, HTTP, MCP, a daemon, or a native helper merely to avoid measuring the CLI route first.
 
 ## Migration Plan
 
-### Phase 0: contracts and safety foundation
+### Phase 0: local contracts and control ledger
 
-**Status: required before automatic writes.**
+**Status: GO. Only this repository changes.**
 
 Deliver:
 
-- Provenance schema and stable source identity.
 - Independent memory authorization policy.
-- Versioned JSONL protocol.
-- Stable operation IDs and durable receipts.
-- Mutation journal and repair state machine.
-- Tombstone, cascade, retention, and audit specification.
-- Exact scope-filter query design.
-- Threat model and failure-injection plan.
+- Stable project identity, memory names, operation IDs, and provenance schema.
+- `node:sqlite` schema and migrations for operations, memories, provenance, relations, tombstones, cursors, retries, and dead letters.
+- Structured adapter error and receipt types.
+- Payload limits, redaction boundary, retention policy, and threat model.
+- Unit tests for state-machine transitions and crash windows.
 
 Acceptance gates:
 
-- Repeating a mutating `opId` returns the same receipt.
-- Scope tests prove zero cross-project results.
-- A crash after each storage stage converges through repair.
-- A tombstoned item is immediately absent from all recall paths.
+- Ledger migrations are idempotent and transactional.
+- Repeating an operation ID cannot create a second ledger memory.
+- Scope tests prove zero cross-project plugin recall.
+- Tombstoned records are immediately absent from every plugin recall path.
 
-### Phase 1: read-only sidecar and bounded recall
+### Phase 1: host CLI adapter and bounded read-only recall
 
-**Status: conditional GO after the read-path subset of Phase 0.**
+**Status: conditional GO after Phase 0 foundations.**
 
 Deliver:
 
-- Persistent stdio sidecar with one explicit shelf.
-- Host-owned sidecar lifecycle and health state.
+- Absolute binary resolution and compatible-version check.
+- `execFile` adapter with fixed argv, `shell: false`, timeout, cancellation, and output caps.
+- Structured parsing for supported read/query operations.
+- Per-shelf mutation serialization and bounded read concurrency.
 - `agent/pre-step` same-request recall.
-- Exact project/global filtering.
-- FTS fallback when embedding is unavailable.
-- Strict timeout, cancellation, result, byte, and token budgets.
+- Exact-scope ledger/cache baseline recall.
+- Best-effort Hypatia FTS/vector supplement within the remaining deadline.
 - Recall provenance and untrusted-data framing.
+- CLI benchmark report for the performance decision gate.
 
 Acceptance gates:
 
-- Sidecar crash or timeout never fails the user turn.
-- Recall respects cancellation and the configured deadline.
+- Adapter failure or timeout never fails the user turn.
+- Recall respects cancellation and the total deadline.
 - No recall message is recursively indexed.
-- Resume and fork behavior matches the cursor/seed policy.
-- P95 added latency remains within the configured local budget.
+- Wrong-scope or tombstoned Hypatia candidates never reach the model.
+- No timed-out child process remains alive.
+- P95 behavior and supported dataset size are documented.
 
 ### Phase 2: explicit memory and compaction ingestion
 
-**Status: conditional GO after idempotent mutations and deletion previews exist.**
+**Status: conditional GO after write verification and deletion preview tests pass.**
 
 Deliver:
 
 - Narrow memory tools without general Bash.
+- Durable intent before each Hypatia mutation.
+- Stable plugin-owned names and exact read-back verification.
 - Idempotent ingestion of DSH `compaction/summary` events.
 - Project-scoped explicit remember.
-- Two-stage exact-ID forget with tombstones.
-- Operation and deletion audit status.
+- Two-stage exact-ID forget with immediate ledger tombstone.
+- Retry, reconciliation, conflict, and cleanup status.
 
 Acceptance gates:
 
-- The same compaction range cannot create duplicate memories.
-- The final assistant response is never lost because no next turn occurred.
-- Explicit remember reports a durable receipt.
+- The same compaction range cannot create duplicate ledger or Hypatia records.
+- The final assistant response does not depend on a future turn for capture.
+- Explicit remember reports only verified or explicitly uncertain status.
+- A lost CLI response is reconciled by stable key before retry.
 - Forget preview cannot broaden into an unreviewed delete selector.
 
 ### Phase 3: background model-assisted extraction
@@ -452,19 +592,36 @@ Acceptance gates:
 Deliver:
 
 - Durable extraction cursor and retry/dead-letter state.
-- Separately configured auxiliary LLM route.
+- Separately configured auxiliary LLM route through existing DSH services.
 - Versioned proposal schema and host validator.
-- Project-scoped work-unit/decision/preference candidates.
+- Project-scoped work-unit, decision, and preference candidates.
 - Redaction, deduplication, relation fanout limits, and audit.
 
 Acceptance gates:
 
-- Restart, duplicate notification, lost response, resume, fork, and concurrent-session tests pass.
-- The model cannot set scope, provenance, permission, path, query program, or delete targets.
+- Restart, duplicate notification, resume, fork, and concurrent-session tests pass.
+- The model cannot set scope, provenance, permission, path, CLI argv, query program, or delete targets.
 - Failed extraction never blocks the primary conversation.
 - Automatic output cannot become a trusted global rule or taboo.
 
-### Phase 4: full-transcript vector mirror
+### Phase 4: optional in-repository helper
+
+**Status: discussion required; not authorized by this GOAL alone.**
+
+Trigger:
+
+- The Phase 1 benchmark demonstrates that the one-shot CLI cannot meet an agreed requirement after caching, budgeting, and concurrency tuning.
+
+Before implementation, discuss and approve:
+
+- Rust dependency and pinning strategy.
+- Build matrix and release artifacts.
+- Installation and upgrade behavior.
+- Crash isolation and protocol framing.
+- Whether the helper uses only public `hypatia::Lab` APIs.
+- Residual DuckDB/SQLite/embedding consistency limitations.
+
+### Full-transcript vector mirror
 
 **Status: NO-GO by default; strict opt-in only.**
 
@@ -473,8 +630,8 @@ Prerequisites:
 - Per-session explicit consent.
 - Provenance-indexed chunking with versioned chunker/model identity.
 - Independent TTL and retention policy.
-- Complete delete cascade across chunks, FTS, vectors, relations, summaries, archives, exports, and backups.
-- Rebuild from the DSH source log.
+- Complete plugin-ledger cleanup semantics.
+- Honest documentation of Hypatia export/backup limitations.
 - Scope isolation, audit, and prompt-injection hardening.
 
 Until every prerequisite is met, store only semantic memories, summaries, confirmed rules/taboos, relationships, and provenance.
@@ -493,14 +650,14 @@ However, the current `TRIGGER + skill + Bash` bridge remains a temporary compati
 - Assistant logging is queued to the next step and can lose the final response.
 - Turn counters and startup state are process-local.
 - The model reconstructs data that host events already contain exactly.
-- Writes have no durable operation ID, transaction, receipt, retry, or repair contract.
+- Writes have no durable operation ID, verification receipt, retry, or repair wrapper.
 - Generic Bash and CLI operations widen prompt-injection and destructive-delete risk.
 - Raw transcript duplication increases privacy and retention obligations.
 - `danger-full-access` is incorrectly overloaded as memory authorization.
 
 Migration rule:
 
-- Keep the bridge behind an explicit legacy feature flag while the sidecar path is incomplete.
+- Keep the bridge behind an explicit legacy feature flag while the host CLI adapter is incomplete.
 - Do not add new features to the trigger protocol.
 - At cutover, remove automatic `TRIGGER:log`, `TRIGGER:extract`, and `TRIGGER:immediate` messages.
 - Replace `hypatia-memory` Bash instructions with narrow tool behavior.
@@ -508,29 +665,32 @@ Migration rule:
 
 ## Implementation Order
 
-Recommended pull-request sequence:
+Recommended pull-request sequence, all in this repository:
 
-1. **Hypatia protocol:** explicit-shelf stdio server, handshake, machine errors, health, limits, and process lock.
-2. **Hypatia read path:** exact scoped FTS/vector recall and no per-open FTS rebuild.
-3. **DSH plugin read path:** sidecar client, memory policy, pre-step recall, budgets, health, and failure handling.
-4. **Hypatia mutation foundation:** operation journal, stable receipts, upsert/batch, index state, and repair.
-5. **Hypatia deletion foundation:** provenance index, tombstones, relation cascade, and cleanup status.
-6. **DSH explicit tools:** remember, search, forget preview/confirm, status, and audit events.
-7. **Compaction ingestion:** durable cursor and idempotent summary commits.
-8. **Auxiliary extraction:** proposal schema, validator, retry/dead-letter, and red-team tests.
-9. **Legacy removal:** delete automatic trigger/Bash orchestration after migration acceptance tests pass.
+1. **Control ledger:** memory policy, `node:sqlite` schema, stable identities, state machine, and migrations.
+2. **CLI adapter:** binary/version resolution, safe `execFile`, limits, normalization, and serialization.
+3. **Read path:** ledger/cache recall, optional Hypatia supplement, pre-step integration, and benchmarks.
+4. **Mutation wrapper:** durable intent, stable names, read-back verification, retry, conflict, and reconciliation.
+5. **Explicit tools:** remember, search, forget preview/confirm, status, and reconcile.
+6. **Compaction ingestion:** durable cursor and idempotent summary operations.
+7. **Auxiliary extraction:** proposal schema, validator, retry/dead-letter, and red-team tests.
+8. **Legacy removal:** delete automatic trigger/Bash orchestration after migration acceptance tests pass.
+9. **Performance decision:** discuss an in-repository helper only if measured CLI behavior misses the agreed target.
 
 ## Definition of Done
 
-The architecture is complete when:
+The plugin-only architecture is complete when:
 
+- No DeepSeek Harness or Hypatia source change is required.
 - Normal memory use requires no Agent Bash access and no `danger-full-access` session.
 - User and assistant source facts are consumed from durable DSH events without depending on a future turn.
 - Recall enters the same request, stays within fixed budgets, and fails open.
-- All scopes are host-derived and enforced before retrieval ranking.
-- Every mutation is idempotent, journaled, repairable, and returns a durable receipt.
-- Resume, fork, crash, retry, duplicate delivery, and concurrent sessions do not create duplicate semantic memories.
-- Prompt injection cannot grant permissions, select global scope, or choose destructive targets.
-- Forget immediately hides data and exposes verifiable cleanup status.
-- The raw transcript remains canonical in DSH; Hypatia defaults to semantic-only storage.
-- Full transcript mirroring remains opt-in and cannot be enabled without its retention and deletion guarantees.
+- Exact plugin scope is enforced by host-derived ledger identity before model injection.
+- Every plugin mutation has durable intent, a stable operation ID, read-back verification, and explicit uncertain/conflict states.
+- Resume, fork, retry, duplicate delivery, and concurrent sessions do not create duplicate plugin-owned semantic memories.
+- Prompt injection cannot grant permissions, select global scope, supply CLI argv, or choose destructive targets.
+- Forget immediately hides data from plugin recall and exposes honest active-shelf cleanup status.
+- The raw transcript remains canonical in DSH; the plugin ledger stores semantic control data only.
+- Hypatia remains unmodified and is treated as an external projection with documented consistency limits.
+- Full transcript mirroring remains opt-in and cannot be enabled without its retention and deletion prerequisites.
+- A Rust/native helper is not introduced without measured need and explicit user approval.
