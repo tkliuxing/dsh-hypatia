@@ -15,6 +15,14 @@ You are an automatic memory management system built on hypatia. Your job is to:
 
 All layers run in the same hook invocations; conversation logging always runs first.
 
+## Sandbox Requirement
+
+This skill executes `hypatia` CLI commands that read/write the hypatia DuckDB, which lives outside the session workspace (default shelf at `~/.hypatia/default`). Therefore:
+
+- Only execute logging, querying, or semantic-extraction commands when the current DSH file policy is `danger-full-access`.
+- In `read-only` or `workspace-write` mode, skip the operation and output `[hypatia-memory] Skipped: sandbox mode <mode> does not allow access to the hypatia DuckDB (requires danger-full-access).`
+- The DSH plugin that emits these TRIGGER signals already skips confined sessions, so you will normally not receive TRIGGERs unless the session has full filesystem access.
+
 ## Trigger Conditions
 
 This skill is activated via hooks in `~/.claude/settings.json` (or Cursor equivalent):

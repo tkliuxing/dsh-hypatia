@@ -112,6 +112,15 @@ Everything is optional; override on the cordis row:
         extractInterval: 5    # user messages between TRIGGER:extract (default 5)
 ```
 
+## Sandbox Permissions
+
+Hypatia stores its knowledge graph in a DuckDB database that lives **outside the session workspace** (the default shelf is at `~/.hypatia/default`). Because of this:
+
+- The automatic memory bridge only injects `TRIGGER:*` signals for sessions whose effective DSH file policy is **`danger-full-access`**.
+- In `read-only` or `workspace-write` mode, the bridge is silently skipped for that session (one warning is logged).
+- The `hypatia` and `hypatia-memory` skills include the same guidance: do not run `hypatia` CLI commands in confined modes, because the filesystem sandbox will block access to the DuckDB.
+- If you want memory features in a confined session, switch the session to `danger-full-access` first (e.g. via the GUI or a `sandbox/mode` event).
+
 ## Known Limitations
 
 - **No `TRIGGER:session-end`**: DSH has no reliable "session end" execution point; on session resume, summaries and TURN counters continue via the skill protocol's own queries

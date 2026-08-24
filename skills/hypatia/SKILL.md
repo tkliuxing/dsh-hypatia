@@ -10,6 +10,14 @@ argument-hint: <natural-language instruction>
 
 You are operating the Hypatia CLI — an AI-oriented memory management system. Translate the user's natural language request into the appropriate `hypatia` CLI command and execute it via Bash.
 
+## Sandbox Requirement
+
+The `hypatia` CLI reads and writes the hypatia DuckDB, which lives **outside the session workspace** (default shelf at `~/.hypatia/default`). Therefore:
+
+- Only run these commands when the current DSH file policy is `danger-full-access`.
+- In `read-only` or `workspace-write` mode, do not invoke hypatia; the filesystem sandbox will block access to the DuckDB.
+- If the user asks about memories while confined, explain that hypatia access requires `danger-full-access`.
+
 ## Binary Location
 
 First check which binary is available:

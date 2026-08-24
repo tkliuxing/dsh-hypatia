@@ -112,6 +112,15 @@ dsh plugin --profile web remove dsh-hypatia   # 卸载
         extractInterval: 5    # 每 N 条用户消息触发一次 TRIGGER:extract（默认 5）
 ```
 
+## 沙箱权限
+
+Hypatia 将知识图谱存储在会话工作区**之外**的 DuckDB 数据库中（默认 shelf 位于 `~/.hypatia/default`）。因此：
+
+- 自动记忆桥接仅对当前 DSH 文件策略为 **`danger-full-access`** 的会话注入 `TRIGGER:*` 信号。
+- 在 `read-only` 或 `workspace-write` 模式下，该会话的桥接会被静默跳过（日志中会记录一次警告）。
+- `hypatia` 与 `hypatia-memory` skill 中也包含相同提示：受限制模式下不要执行 `hypatia` CLI 命令，因为文件沙箱会阻止访问 DuckDB。
+- 若想在受限制会话中使用记忆功能，请先把会话切换到 `danger-full-access`（例如通过 GUI 或 `sandbox/mode` 事件）。
+
 ## 已知限制
 
 - **无 `TRIGGER:session-end`**：DSH 没有可靠的“会话结束”执行时机；会话恢复时摘要与 TURN 计数靠 skill 协议中的查询自行续接
