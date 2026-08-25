@@ -48,6 +48,8 @@ Requires **Node 22.5+** for `node:sqlite`. The benchmark creates and removes its
 
 These are each covered by tests, so violating one fails the suite — but the *reasons* are not obvious from the code alone.
 
+- **`inject` is a flat array of service names.** Cordis reads the normalized form with `Object.keys(fiber.inject)`, so `{required: [...], optional: [...]}` is taken as two services literally named `required` and `optional`. They never resolve, the entry stays pending, and *the whole profile fails to boot* — this shipped once with a green suite. Only list services every profile has: a service named here that a profile lacks is a hard boot failure for the entire tree, which is why `tools` and `sandboxPolicy` are accessed defensively instead.
+- **Compaction identity comes from `shadowedSeqs`, never `shadowedRange`.** `shadowedRange` is a surface-POSITION span, not a seq interval: `start` can exceed `end` after a replacement summary node lands at an older range's position, and two compactions can share a bounding pair while shadowing different nodes. `sourceRangeKey` hashes the exact sorted set, and `memory_provenance.source_range_key` (schema v2) makes the dedup lookup exact. `first`/`last` exist for provenance and display only. An event without `shadowedSeqs` is skipped, not ingested under a weaker key.
 - **One Hypatia process at a time.** `adapter.maxConcurrentReads` defaults to 1 and this is a measured requirement, not caution. Every `hypatia` invocation opens *all* registered shelves and DuckDB takes an exclusive file lock, so concurrent invocations collide even when they are pure reads on different shelves. Measured against 0.1.4: four concurrent `hypatia query` calls → three `Conflicting lock is held` failures.
 - **Exit status is not a success signal, in either direction.** `knowledge-get` and `query` print human "not found" text with exit 0; `similar` prints `Error:` with exit 0; writes fail with exit 1. `src/adapter/parse.js` classifies from the text and treats exit code as corroboration only. Its header table records the observed behaviour per command.
 - **A zero exit is not a receipt.** Only `commitReceipt` after an exact read-back and payload-hash match moves a record to `applied`. A duplicate key with a matching hash means "our retry already succeeded"; a different hash is a `conflict` that must never be overwritten.
@@ -56,6 +58,9 @@ These are each covered by tests, so violating one fails the suite — but the *r
 - **Recall fails open.** Any timeout, cancellation, adapter fault, or parse failure yields zero entries and the turn proceeds. It also runs after `await next()` and only appends to an accepted decision.
 - **Forget tombstones before touching Hypatia.** After `ledger.tombstone()` returns, recall already excludes the record even if the process dies. Cleanup status is reported exactly (`cleanup-uncertain` is a real outcome, not a failure to hide).
 - **`memory_forget_confirm` accepts only IDs from its preview token.** That gate is the reason a prompt injection cannot broaden a delete.
+- **A capped list must announce its cap.** `memory_forget_preview` returns `matched`, `listed`, `total_in_scope`, and `truncated`. A user confirming a silently truncated list believes the project is clean while entries remain. "Forget everything" is `match: 'all'`, because the words a user says for it appear in none of the stored memories and a term search would return an empty list that reads as "nothing to delete".
+- **One operation, one capability.** The startup reconciliation pass and `memory_reconcile` both check `Capability.RECONCILE`. When they disagreed, a default deployment could dispatch writes it had no way to settle, while `memory_status` advised a tool that always refused. `memory_status` also never names a tool the current policy withholds.
+- **Registration reads the cursor, not just writes it.** `registerCompactionIngest` scans `session.events` for summaries above `session_cursor.last_applied_seq`, because `session/event` only ever delivers *future* compactions — a resume, reload, or mid-project enable would otherwise skip everything already logged. The cursor is a fast-path skip; `ingestOne`'s exact range-key check is the correctness boundary.
 - **No imports from harness packages.** `recallMessage` in `index.js` and `pluginMessage` in the legacy bridge inline `createUserMessage` from `@deepseek-ai/dsh-llm` on purpose: a link install resolves imports from the checkout path, where in-box harness packages are unreachable. Tool definitions are likewise plain objects rather than `defineTool` calls.
 
 ### DSH APIs this depends on
@@ -64,9 +69,18 @@ The harness is a sibling checkout at `../deepseek-harness` — **read it for API
 
 - `ctx.on('agent/pre-step', async (payload, next) => ...)` — call `await next()` first, return `{kind: 'enter', messages}`. Claimed inbox messages are in the payload, not yet in `session.events`.
 - `agent.ctx.tools.register(definition)` → disposer. A definition is `{name, description, parameters, output: {schema, render}, execute}`; the JSON Schema subset is enforced by `assertSupportedJsonSchema` (`packages/core/tools/src/json-schema.ts`) and allows only `type`, `oneOf`, `properties`, `required`, `additionalProperties`, `items`, `enum`, `const`, and annotations.
-- `ctx.on('session/event', (session, event) => ...)` — `compaction/summary` carries `shadowedRange`, which is what makes ingestion idempotent.
+- `ctx.on('session/event', (session, event) => ...)` — `compaction/summary` carries `shadowedSeqs` (authoritative) and `shadowedRange` (a surface-position span; see the invariant above). `session.events` holds what was logged before this plugin loaded.
+- `ctx.effect(fn, label)` is the teardown seam; `ctx.on('dispose')` is not a cordis event and never fires.
 - `source: {kind: 'plugin', plugin, form}` — `form: 'recall'` marks retrieved reference context; `'notice'` also needs a `summary`.
 - Session header fields used for identity: `id`, `createdAt`, `cwd`, `parentSession`, `seedLength`, `origin`.
+
+### Testing the wiring, not only the parts
+
+`apply()` skips any agent absent from `ctx.agents.roots()`. A fake whose `roots()` returns a constant `[]` therefore short-circuits *every* per-agent registration — tools, compaction ingest, scoping, disposal — while the suite stays green. That is exactly how a broken `inject` reached a real profile with 179 tests passing.
+
+So: `tests/plugin.spec.js` must publish agents the way the runtime does (push to the root list, then emit `agent/created`), and must execute at least one registered tool rather than only asserting that names appear. `tests/tools.spec.js` calls `registerMemoryTools` directly and deliberately bypasses the wiring — it cannot cover this.
+
+Prefer a mutation check for anything load-bearing: break the code deliberately and confirm the new tests fail. Several invariants above were confirmed that way, and one test that passed either way was rewritten because of it.
 
 ## GOAL.md is binding
 
