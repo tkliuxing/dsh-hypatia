@@ -2,27 +2,28 @@
 
 [中文文档](./README.zh.md)
 
-[Hypatia](https://github.com/MarchLiu/hypatia) memory plugin for DeepSeek Harness: connects DSH sessions to the hypatia local knowledge graph, giving agents **long-term memory across sessions**.
+Long-term memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), backed by the [Hypatia](https://github.com/MarchLiu/hypatia) knowledge graph.
+
+The plugin runs Hypatia itself, in host code. The model is not responsible for logging, database orchestration, permissions, retries, or deletion — it only proposes what is worth remembering.
 
 What you get:
 
-- **Automatic memory** — every conversation turn is logged to the knowledge graph; oversized conversations are compressed through hierarchical summaries instead of blowing up the context
-- **Project rules/taboos auto-loaded** — new sessions load the current project's and global rules/taboos at startup, so the agent follows your project conventions from the very first turn
-- **Semantic distillation** — completed discussions are mined for work units (technical decisions, correction chains, design rationales) that resurface when related topics come up
-- **Explicit control** — tell the agent "remember …" / "forget …" anytime to read and write memory directly; knowledge-graph questions trigger the `hypatia` skill
+- **Recall in the same request** — relevant project memories are retrieved and attached to the turn that needs them, inside a fixed time and size budget, and always failing open
+- **Exact project scoping** — memories belong to one project, derived from the canonical workspace path; cross-project leakage is prevented by a host-side ledger, not by hoping content tags line up
+- **Verified writes** — every write is read back and compared before it counts as stored, so "saved" means saved
+- **Two-stage forget** — you see exactly what will be deleted before anything is deleted, and cleanup status is reported honestly rather than optimistically
+- **No Bash required** — memory works in `read-only` and `workspace-write` sessions, because the plugin never asks the model to shell out
 
 ## Prerequisites
 
-**The `hypatia` command must be installed on your PATH.** The plugin probes `hypatia --version` at load time; if it is missing, a warning is logged and nothing is registered (neither skills nor the memory bridge). Install hypatia and restart dsh to enable.
-
-Install hypatia from source:
+**The `hypatia` command must be on your PATH,** and **Node 22.5+** (the control ledger uses `node:sqlite`). At load the plugin resolves the binary to an absolute path and checks its version; if either fails it logs a warning and memory stays inactive.
 
 ```sh
 git clone https://github.com/MarchLiu/hypatia
 cd hypatia && cargo build --release
 # put target/release/hypatia on your PATH
 
-# Optional: download the BGE-M3 embedding model (required for vector search / similar recall)
+# Optional: the BGE-M3 embedding model, only needed for vector search
 mkdir -p ~/.hypatia/default
 hf download BAAI/bge-m3 --local-dir /tmp/bge-m3
 cp /tmp/bge-m3/onnx/model.onnx ~/.hypatia/default/embedding_model.onnx
@@ -43,60 +44,51 @@ dsh plugin --profile web add github:tkliuxing/dsh-hypatia
 pnpm dsh plugin --profile web add /path/to/dsh-hypatia
 ```
 
-**Restart dsh** after installation.
+**Restart dsh** after installing or after editing `index.js`, `src/`, or `skills/`.
 
 ## Usage
 
-**No manual steps required** — the memory bridge is fully automatic: every message is logged, every 5 user messages trigger a check for extractable memories, and new sessions load rules at startup.
+Recall and summary ingestion are automatic. Beyond that, the agent has five tools it uses on your behalf:
 
-On top of that, you can:
-
-| Action | Effect |
+| You say | What happens |
 |---|---|
-| Tell the agent "remember: this project forbids eval" | Explicitly stores a memory (rule / taboo / memory) |
-| Tell the agent "forget what you know about X" | Searches and deletes the related knowledge and relationships |
-| Ask "what does the knowledge base say about Y", "search earlier decisions" | Triggers the `hypatia` skill for JSE / full-text / vector queries |
+| "remember: this project forbids eval" | `memory_remember` stores one user-confirmed rule in this project's scope |
+| "what do we know about the retry policy?" | `memory_search` returns this project's memories, labelled as reference data |
+| "forget what you know about the old API" | `memory_forget_preview` shows the exact entries first; `memory_forget_confirm` deletes only what you approved |
+| "did that actually save?" | `memory_status` reports verified, pending, and uncertain counts |
 
-## Verification
+For knowledge-graph administration — shelves, archives, embedding models, export, or a deliberately unscoped search across the whole graph — the `hypatia` skill drives the CLI directly. That path does require `danger-full-access`.
 
-Config layer (you should see a `# == dsh-hypatia` layer):
+## How it works
 
-```sh
-dsh --profile web --dump-config
+```text
+DSH durable session log
+        |
+        | turn notifications, compaction summaries
+        v
+dsh-hypatia host plugin
+  - memory authorization (independent of the file sandbox)
+  - project/scope derivation, provenance, stable operation IDs
+  - node:sqlite control ledger and retry queue
+  - recall cache, deadline, and context budget
+        |
+        | execFile(absoluteHypatiaPath, fixedArgv)   shell: false
+        v
+Unmodified Hypatia CLI
 ```
 
-End-to-end (confirm the skills and bridge actually work):
-
-1. Open a **new session** — the first injected message should be `[hypatia-memory] TRIGGER:session-start`
-2. Chat a bit in that project, then ask the agent: "search the knowledge base for message entries" — the `hypatia` skill should trigger and return the logged conversation
-
-## Upgrade and Removal
-
-`dsh plugin` is a pnpm forwarder; upgrade and removal run on the same profile, followed by a dsh restart:
-
-```sh
-dsh plugin --profile web update dsh-hypatia   # upgrade
-dsh plugin --profile web remove dsh-hypatia   # remove
-```
-
-## Contents
-
-| Skill | Description |
+| Module | Responsibility |
 |---|---|
-| `hypatia` | Operate the hypatia knowledge graph in natural language: knowledge CRUD, RDF triples, JSE queries, full-text/vector search, shelf management |
-| `hypatia-memory` | Automatic memory system: per-turn conversation logging, hierarchical summary cascade, work-unit extraction, rules/taboos loading |
+| `src/policy.js` | memory capabilities, frozen at load |
+| `src/identity.js` | project scope, stable names, operation IDs, provenance |
+| `src/ledger/` | the plugin-owned SQLite control plane |
+| `src/adapter/` | the one place a subprocess is spawned |
+| `src/mutations.js` | intent → CLI → read-back verification → receipt |
+| `src/recall.js` | same-request recall inside `agent/pre-step` |
+| `src/tools.js` | the narrow `memory_*` tools |
+| `src/ingest/` | idempotent ingestion of DSH compaction summaries |
 
-### Event bridge (the TRIGGER source for hypatia-memory)
-
-`hypatia-memory` was designed around Claude Code hooks (`UserPromptSubmit` / `Stop`) emitting TRIGGER signals. This plugin implements an equivalent bridge using native cordis events:
-
-| DSH event | Trigger signal |
-|---|---|
-| `agent/session-start` | `TRIGGER:session-start` — load project and global rules/taboos |
-| `agent/pre-step` (step 1 of a turn carrying a genuine user message) | `TRIGGER:log`; every 5 user messages appends `TRIGGER:extract`; remember/forget intent appends `TRIGGER:immediate` |
-| `agent/turn-stopping` | `TRIGGER:log (assistant)` — log the assistant reply (queued until the next pre-step) |
-
-The bridge only applies to root sessions (subagent child sessions are skipped).
+[GOAL.md](./GOAL.md) is the authoritative architecture document, including the phases that are deliberately not implemented yet.
 
 ## Configuration
 
@@ -107,31 +99,79 @@ Everything is optional; override on the cordis row:
     - id: dsh-hypatia
       name: 'dsh-hypatia'
       config:
-        memoryBridge: true    # event bridge on/off (default true)
-        registerSkills: true  # skill registration on/off (default true)
-        extractInterval: 5    # user messages between TRIGGER:extract (default 5)
+        memory:
+          preset: standard      # disabled | read-only-recall | standard | full
+        projectId: null         # pin one scope across worktrees
+        state:
+          dir: ~/.dsh/dsh-hypatia
+        adapter:
+          shelf: default
+          timeoutMs: 10000
+          maxConcurrentReads: 1 # see "One process at a time" below
+        recall:
+          enabled: true
+          deadlineMs: 200
+          maxResults: 5
+          maxBytes: 10240
+          hypatiaSupplement: true
+          vectorSupplement: false
+        ingest:
+          compaction: true
+        legacyBridge:
+          enabled: false        # deprecated TRIGGER/Bash protocol
 ```
 
-## Sandbox Permissions
+### Memory authorization
 
-Hypatia stores its knowledge graph in a DuckDB database that lives **outside the session workspace** (the default shelf is at `~/.hypatia/default`). Because of this:
+Memory capabilities are **independent of the DSH file sandbox**. `read-only`, `workspace-write`, and `danger-full-access` govern what the *agent* may touch; they are not memory consent. Presets:
 
-- The automatic memory bridge only injects `TRIGGER:*` signals for sessions whose effective DSH file policy is **`danger-full-access`**.
-- In `read-only` or `workspace-write` mode, the bridge is silently skipped for that session (one warning is logged).
-- The `hypatia` and `hypatia-memory` skills include the same guidance: do not run `hypatia` CLI commands in confined modes, because the filesystem sandbox will block access to the DuckDB.
-- If you want memory features in a confined session, switch the session to `danger-full-access` first (e.g. via the GUI or a `sandbox/mode` event).
+| Preset | Grants |
+|---|---|
+| `disabled` | nothing |
+| `read-only-recall` | recall only |
+| `standard` (default) | recall, semantic write, delete |
+| `full` | adds global-rule write and administration |
 
-## Known Limitations
+Global-rule writes and transcript mirroring are never available to automatic paths, whatever the preset says.
 
-- **No `TRIGGER:session-end`**: DSH has no reliable "session end" execution point; on session resume, summaries and TURN counters continue via the skill protocol's own queries
-- **Changes require a restart**: skill registration and the event bridge run at plugin load time — restart dsh after editing `index.js` or `skills/`
-- **Vector search needs the embedding model**: without the downloaded model, `similar` recall is unavailable; everything else is unaffected
+## Limits worth knowing
+
+These are deliberate, and the plugin reports them rather than papering over them.
+
+- **One process at a time.** Every `hypatia` invocation opens all registered shelves and DuckDB takes an exclusive file lock, so concurrent invocations fail with `Conflicting lock is held` — measured at 3 failures out of 4 concurrent `hypatia query` calls against hypatia 0.1.4. The adapter therefore serializes every call, reads included. Raise `maxConcurrentReads` only if nothing else can touch the same shelves.
+- **Deletion is scoped honestly.** Forget tombstones a record immediately, deletes it from the active shelf, and verifies absence. It cannot reach Hypatia exports, backups, other shelves, unknown user-created relations, or the DSH transcript — and reports `cleanup-uncertain` instead of claiming success when verification is incomplete.
+- **Vector recall is off by default.** Hypatia's top-K cannot pre-filter by scope, so results must be over-fetched and filtered afterwards. Enable `recall.vectorSupplement` only after benchmarking your dataset.
+- **Background extraction is not implemented.** GOAL.md gates it NO-GO until the Phase 0–2 fault and security tests pass; setting `extraction.enabled` logs a warning and changes nothing.
+- **Full-transcript mirroring is not implemented.** It stays off until its consent, retention, and cleanup prerequisites exist.
+
+## Performance
+
+`npm run bench` measures the CLI against the configured recall deadline on a throwaway shelf it creates and removes. Measured on hypatia 0.1.4, Node 22.22, darwin/arm64:
+
+| Records | Concurrency | full recall P50 | P95 | Within 200 ms deadline |
+|---|---|---|---|---|
+| 100 | 1 | 43 ms | 45 ms | yes |
+| 100 | 4 | 93 ms | 176 ms | yes |
+| 500 | 1 | 45 ms | 50 ms | yes |
+| 500 | 4 | 96 ms | 185 ms | yes |
+
+Serialized concurrency is the cost driver, not dataset size: four concurrent sessions land near the deadline while ten times the records barely moves it. If your deployment needs more concurrency, that is the number to re-measure first.
 
 ## Development
 
-`skills/` is self-maintained in this repository (it was once synced from the hypatia repo; the two are now decoupled). Edit `skills/*/SKILL.md` directly — do not overwrite-sync from upstream.
+```sh
+npm test                                    # full suite
+node --test tests/ledger.spec.js            # one file
+npm run bench -- --sizes 100,1000           # performance gate
+```
 
-With a local link install (`dsh plugin add <path>`), changes to `index.js` or `skills/` take effect after restarting dsh.
+`skills/` is self-maintained here — it was once synced from the hypatia repo, but the two are now decoupled. Edit `skills/*/SKILL.md` directly.
+
+## Migrating from the TRIGGER bridge
+
+Earlier versions injected `[hypatia-memory] TRIGGER:*` messages and asked the model to run `hypatia` through Bash. That mode is deprecated and off by default. It writes protocol text into the durable transcript, has no durable operation IDs or write receipts, can lose the final assistant reply, and overloads `danger-full-access` as memory consent.
+
+Set `legacyBridge.enabled: true` only to keep an in-flight deployment working during migration. It takes no new features, and it is safe to run alongside the host path while you verify the tools.
 
 ## License
 

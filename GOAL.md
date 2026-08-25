@@ -10,6 +10,43 @@ Architecture research is complete. This revision applies a hard repository bound
 - An in-repository Rust helper is only a benchmark-triggered fallback and requires a separate design discussion before implementation.
 - Full-transcript vector mirroring remains **NO-GO by default**.
 
+### Implementation state
+
+Phases 0, 1, and 2 are implemented and covered by tests. Phase 3 remains NO-GO and
+Phase 4 remains unauthorized.
+
+| Phase | State | Where |
+|---|---|---|
+| 0 — contracts and control ledger | delivered | `src/policy.js`, `src/identity.js`, `src/ledger/` |
+| 1 — CLI adapter and bounded recall | delivered | `src/adapter/`, `src/recall.js`, `scripts/bench-recall.js` |
+| 2 — explicit memory and compaction ingestion | delivered | `src/mutations.js`, `src/tools.js`, `src/ingest/` |
+| 3 — background model-assisted extraction | NO-GO, unimplemented | `extraction.enabled` is forced off and warns |
+| 4 — in-repository helper | not authorized | — |
+| Full-transcript vector mirror | NO-GO, unimplemented | `transcript-mirror` capability is refused and warns |
+
+The compatibility bridge survives behind `legacyBridge.enabled`, defaulting to off,
+in `src/legacy-bridge.js`.
+
+### Measured facts added since the research revision
+
+Two upstream behaviours were measured during Phase 1 and changed the design:
+
+- **Concurrent CLI invocations are unsafe, reads included.** Every invocation opens
+  all registered shelves and DuckDB takes an exclusive file lock. Four concurrent
+  `hypatia query` calls against 0.1.4 produced three `Conflicting lock is held`
+  failures. The adapter therefore serializes *all* invocations, not just mutations
+  per shelf as this document originally proposed.
+- **Exit status is unreliable in both directions.** `knowledge-get` and `query`
+  report "not found" with exit 0; `similar` reports `Error:` with exit 0; writes
+  fail with exit 1. Classification is therefore text-driven, with exit status as
+  corroboration only.
+
+Recall latency against the 200 ms deadline (hypatia 0.1.4, Node 22.22, darwin/arm64):
+P95 45 ms at 100 records and 50 ms at 500 records single-session; 176 ms and 185 ms
+respectively at four concurrent sessions. Serialized concurrency, not dataset size,
+is the cost driver. The one-shot CLI meets the target at the supported size, so the
+Phase 4 trigger has **not** fired.
+
 ## Goal
 
 Build `dsh-hypatia` as a reliable, scoped, auditable long-term memory capability for DeepSeek Harness without making the primary agent model responsible for deterministic logging, database orchestration, permissions, retries, or deletion.
@@ -520,7 +557,7 @@ Do not introduce N-API, HTTP, MCP, a daemon, or a native helper merely to avoid 
 
 ### Phase 0: local contracts and control ledger
 
-**Status: GO. Only this repository changes.**
+**Status: DELIVERED.** Only this repository changed.
 
 Deliver:
 
@@ -540,7 +577,7 @@ Acceptance gates:
 
 ### Phase 1: host CLI adapter and bounded read-only recall
 
-**Status: conditional GO after Phase 0 foundations.**
+**Status: DELIVERED.** Benchmarked; the Phase 4 trigger did not fire.
 
 Deliver:
 
@@ -565,7 +602,7 @@ Acceptance gates:
 
 ### Phase 2: explicit memory and compaction ingestion
 
-**Status: conditional GO after write verification and deletion preview tests pass.**
+**Status: DELIVERED.** Write-verification and deletion-preview tests pass.
 
 Deliver:
 
@@ -587,7 +624,7 @@ Acceptance gates:
 
 ### Phase 3: background model-assisted extraction
 
-**Status: NO-GO until Phases 0-2 pass fault and security tests.**
+**Status: NO-GO.** Phases 0-2 are delivered, but their fault and security tests have not been reviewed as a release gate, so this stays unimplemented and `extraction.enabled` is forced off.
 
 Deliver:
 
@@ -674,8 +711,8 @@ Recommended pull-request sequence, all in this repository:
 5. **Explicit tools:** remember, search, forget preview/confirm, status, and reconcile.
 6. **Compaction ingestion:** durable cursor and idempotent summary operations.
 7. **Auxiliary extraction:** proposal schema, validator, retry/dead-letter, and red-team tests.
-8. **Legacy removal:** delete automatic trigger/Bash orchestration after migration acceptance tests pass.
-9. **Performance decision:** discuss an in-repository helper only if measured CLI behavior misses the agreed target.
+8. **Legacy removal:** delete `src/legacy-bridge.js` and its skill appendix once deployments have migrated off `legacyBridge.enabled`.
+9. **Performance decision:** measured; the CLI meets the target at the supported size. Re-measure before raising concurrency.
 
 ## Definition of Done
 
