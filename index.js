@@ -1,351 +1,299 @@
 /**
- * dsh-hypatia — Hypatia skills for DeepSeek Harness.
+ * dsh-hypatia - long-term memory for DeepSeek Harness, backed by Hypatia.
  *
- * Contributes the two hypatia skills (`hypatia`, `hypatia-memory`) to the
- * session skill catalog, and bridges DSH agent lifecycle events onto the
- * Claude-Code-style TRIGGER protocol the `hypatia-memory` skill expects:
+ * The plugin owns lifecycle integration, memory authorization, durable
+ * operation state, scope derivation, provenance, recall budgets, validation,
+ * retries, and observability. Hypatia stays an unmodified external semantic
+ * store reached through its installed CLI, and DSH session persistence stays
+ * the source of truth for raw conversation history.
  *
- *   - agent/session-start  -> TRIGGER:session-start (load rules/taboos)
- *   - agent/pre-step        -> TRIGGER:log per genuine user message
- *                              (+ TRIGGER:extract every N user turns,
- *                               + TRIGGER:immediate on remember/forget intent)
- *   - agent/turn-stopping   -> TRIGGER:log for the assistant reply
+ * Wiring only lives here; the pieces are:
  *
- * The memory bridge only runs for sessions whose effective file-sandbox mode
- * is `danger-full-access`, because hypatia's DuckDB lives outside the session
- * workspace (typically `~/.hypatia/default`). Read-only and workspace-write
- * sessions are silently skipped (one warning per session).
+ *   src/policy.js        memory capabilities, independent of the file sandbox
+ *   src/identity.js      project scope, stable names, operation IDs, provenance
+ *   src/ledger/          the plugin-owned SQLite control plane
+ *   src/adapter/         the one place a subprocess is spawned
+ *   src/mutations.js     intent -> CLI -> read-back verification -> receipt
+ *   src/recall.js        same-request recall inside `agent/pre-step`
+ *   src/tools.js         the narrow `memory_*` tools, replacing model Bash
+ *   src/ingest/          idempotent ingestion of DSH compaction summaries
+ *   src/legacy-bridge.js the deprecated TRIGGER bridge, off by default
  *
- * The plugin requires the `hypatia` CLI on PATH. When it is missing the
- * plugin logs a warning and registers nothing.
- *
- * Optional config (cordis row `config:`):
- *   memoryBridge:   boolean (default true)  — event bridge on/off
- *   registerSkills: boolean (default true)  — skill catalog registration on/off
- *   extractInterval: number (default 5)     — user turns between TRIGGER:extract
+ * See GOAL.md for the architecture this implements and the limits it refuses
+ * to overstate.
  *
  * @module dsh-hypatia
  */
 
-import { spawnSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { dirname, join, basename } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+import { createAdapter } from './src/adapter/cli.js'
+import { normalizeConfig } from './src/config.js'
+import { deriveProjectIdentity } from './src/identity.js'
+import { registerCompactionIngest } from './src/ingest/compaction.js'
+import { openLedger } from './src/ledger/ledger.js'
+import { registerMemoryBridge } from './src/legacy-bridge.js'
+import { MutationCoordinator } from './src/mutations.js'
+import { Capability, createMemoryPolicy } from './src/policy.js'
+import { RecallService } from './src/recall.js'
+import { registerSkills } from './src/skills.js'
+import { registerMemoryTools } from './src/tools.js'
 
 /** Cordis plugin name used by loader diagnostics and message provenance. */
 export const name = 'dsh-hypatia'
 
-/** Skill registry and agent registry drive everything this plugin does. */
-export const inject = ['skills', 'agents']
+/**
+ * Services this plugin needs before it can install anything. `tools` is
+ * required for the narrow memory tools; without it the plugin still provides
+ * skills and recall.
+ */
+export const inject = {
+  required: ['skills', 'agents'],
+  optional: ['tools', 'sandboxPolicy'],
+}
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const SKILLS_DIR = join(PLUGIN_DIR, 'skills')
 
-/** Remember/forget intent in either language, matched against the user prompt. */
-const EXPLICIT_MEMORY_RE =
-  /记住|记一下|记下|请不要忘记|别忘了|请记住|忘掉|忘记|取消记住|\bremember\b|\bforget\b/i
-
 /** Best-effort logging that never breaks plugin load. */
-function warn(ctx, message) {
-  try {
-    ctx.logger(name).warn(message)
-  } catch {
-    console.warn(`[${name}] ${message}`)
-  }
-}
-
-/** Probe the `hypatia` CLI on PATH once at load time. */
-function hypatiaAvailable() {
-  const probe = spawnSync('hypatia', ['--version'], { stdio: 'ignore' })
-  return !probe.error && probe.status === 0
-}
-
-/**
- * Parse the small controlled frontmatter of a packaged SKILL.md.
- * Only the keys these skills use are supported: scalar values, double-quoted
- * strings, and booleans.
- */
-function parseSkillFile(file) {
-  const raw = readFileSync(file, 'utf8')
-  const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/)
-  if (!match) throw new Error(`${file}: missing frontmatter block`)
-  const meta = {}
-  for (const line of match[1].split(/\r?\n/)) {
-    const kv = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/)
-    if (!kv) continue
-    let value = kv[2].trim()
-    if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
-      try {
-        value = JSON.parse(value)
-      } catch {
-        value = value.slice(1, -1)
-      }
+function makeWarn(ctx) {
+  return (message) => {
+    try {
+      ctx.logger(name).warn(message)
+    } catch {
+      console.warn(`[${name}] ${message}`)
     }
-    meta[kv[1]] = value
-  }
-  return { meta, content: raw.slice(match[0].length) }
-}
-
-/** Register every packaged skill directory (`<name>/SKILL.md`). */
-function registerSkills(ctx) {
-  if (!existsSync(SKILLS_DIR)) {
-    warn(ctx, `skills directory missing: ${SKILLS_DIR} — package is incomplete, reinstall the plugin`)
-    return
-  }
-  for (const entry of readdirSync(SKILLS_DIR, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue
-    const dir = join(SKILLS_DIR, entry.name)
-    const file = join(dir, 'SKILL.md')
-    if (!existsSync(file)) continue
-    const { meta, content } = parseSkillFile(file)
-    if (!meta.name || !meta.description) {
-      warn(ctx, `${file}: frontmatter requires name and description, skipped`)
-      continue
-    }
-    ctx.skills.register({
-      name: meta.name,
-      description: meta.description,
-      content,
-      source: 'bundled',
-      path: file,
-      resourceBase: { kind: 'directory', path: dir },
-      invocation: {
-        modelInvocable: meta['disable-model-invocation'] !== 'true',
-        userInvocable: meta['user-invocable'] !== 'false',
-      },
-    })
   }
 }
 
-/** Project label for hypatia scopes: basename of the session workspace. */
-function projectOf(agent) {
-  const cwd = agent.session.header.cwd
-  return cwd ? basename(cwd) : 'default'
-}
-
-/** Whether this session is a top-level user session (subagent children are skipped). */
+/** Whether this session is a top-level user session. */
 function isRootSession(agent) {
-  return agent.session.header.origin !== 'subagent'
+  return agent?.session?.header?.origin !== 'subagent'
 }
 
-/**
- * Resolve the effective file-sandbox mode for an agent's session.
- * Returns `undefined` only when no sandbox policy service is composed (legacy
- * or test deployments). Resolution failures propagate so the gate can fail
- * closed and report the error.
- */
-function sessionSandboxMode(ctx, agent) {
-  const policy = ctx.get('sandboxPolicy')
-  return policy?.resolve({ session: agent.session }).mode
-}
-
-/**
- * One user-role plugin message. Mirrors `createUserMessage` from
- * `@deepseek-ai/dsh-llm` (`{ ...input, id: randomUUID(), role: 'user' }`),
- * inlined so this package needs no runtime dependency on harness packages —
- * a `dsh plugin add <dir>` link resolves imports from its real path, where
- * in-box harness packages are not reachable.
- */
-function pluginMessage(text, summary) {
-  return {
-    id: randomUUID(),
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: name, form: 'notice', summary },
-  }
-}
-
-/** Extract plain text from a user message's content blocks. */
+/** Extract plain text from a message's content blocks. */
 function messageText(message) {
-  return (message.content ?? [])
+  return (message?.content ?? [])
     .filter((block) => block.type === 'text')
     .map((block) => block.text)
     .join('\n')
 }
 
 /**
- * Register the hypatia-memory event bridge for the lifetime of `ctx`.
+ * One recall message. Mirrors `createUserMessage` from `@deepseek-ai/dsh-llm`,
+ * inlined so this package needs no runtime dependency on harness packages - a
+ * `dsh plugin add <dir>` link resolves imports from its real path, where
+ * in-box harness packages are not reachable.
  *
- * The bridge is gated by the session's effective file-sandbox mode: it only
- * injects TRIGGER signals when the mode is `danger-full-access`, because the
- * triggered skill runs `hypatia` commands that read/write the hypatia DuckDB
- * outside the workspace. Confined sessions are skipped with a one-time warning.
- *
- * Startup initialization is tracked independently: if a session begins in a
- * confined mode and is later elevated to `danger-full-access`, the missed
- * `TRIGGER:session-start` is injected at the first full-access opportunity.
- * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {{ extractInterval: number }} options
+ * `form: 'recall'` marks it as retrieved reference context rather than an
+ * instruction or a notice.
  */
-export function registerMemoryBridge(ctx, { extractInterval }) {
-  /** Per-session bridge state. */
-  const states = new Map()
-  const stateFor = (id) => {
-    let state = states.get(id)
-    if (!state) {
-      state = { userTurns: 0, countedTurns: new Set() }
-      states.set(id, state)
-    }
-    return state
+function recallMessage(text) {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'plugin', plugin: name, form: 'recall' },
   }
-
-  /**
-   * Sessions already warned about confined mode, so we log the skip reason
-   * only once per session.
-   */
-  const warnedSessions = new Set()
-  const warnSkippedOnce = (agent, action, reason) => {
-    const sessionId = String(agent.session.id)
-    if (warnedSessions.has(sessionId)) return
-    warnedSessions.add(sessionId)
-    warn(ctx, `hypatia-memory ${action} skipped for session ${sessionId}: ${reason}`)
-  }
-
-  /**
-   * Sessions whose startup trigger has already been injected. Tracked
-   * separately so a session created confined and later elevated still gets
-   * its rules/taboos loaded and its turn counter restored.
-   */
-  const startupInjected = new Set()
-  const buildStartupMessage = (agent) => {
-    const sessionId = String(agent.session.id)
-    if (startupInjected.has(sessionId)) return undefined
-    startupInjected.add(sessionId)
-    const project = projectOf(agent)
-    return pluginMessage(
-      `[hypatia-memory] TRIGGER:session-start\n`
-      + `SESSION_ID: ${sessionId}，PROJECT: ${project}\n`
-      + `请通过 skill 工具加载 hypatia-memory 并执行 Session Startup：查询并内化 PROJECT=${project} `
-      + `与全局 scope 的 rule / taboo 知识条目。若已存在 msg-${sessionId}-* 条目（会话恢复），`
-      + `TURN 计数从现有最大序号继续。本会话后续的 [hypatia-memory] TRIGGER 信号均按该 skill 的协议处理。`,
-      'hypatia-memory：会话启动，加载 rules/taboos',
-    )
-  }
-
-  /**
-   * Common gate for every bridge event: confined sessions warn once and are
-   * skipped; full-access sessions are allowed through. Startup injection is
-   * handled by each caller so that pre-step can place the startup message in
-   * the same decision before the log notice (agent.inject() during pre-step
-   * would queue it for the next step).
-   */
-  const guardAccess = (agent, action) => {
-    let mode
-    try {
-      mode = sessionSandboxMode(ctx, agent)
-    } catch (error) {
-      warnSkippedOnce(
-        agent,
-        action,
-        `sandbox policy resolution failed (${String(error)}); danger-full-access was not confirmed.`,
-      )
-      return false
-    }
-    // No sandbox policy service composed: treat as unrestricted (legacy / test).
-    if (mode === undefined || mode === 'danger-full-access') return true
-    warnSkippedOnce(
-      agent,
-      action,
-      `sandbox mode "${mode}" cannot access the hypatia DuckDB (requires danger-full-access).`,
-    )
-    return false
-  }
-
-  ctx.on('agent/disposed', ({ agent }) => {
-    states.delete(String(agent.session.id))
-    warnedSessions.delete(String(agent.session.id))
-    startupInjected.delete(String(agent.session.id))
-  })
-
-  // Claude Code `SessionStart` equivalent: ask the model to load project and
-  // global rules/taboos before the first turn.
-  ctx.on('agent/session-start', ({ agent }) => {
-    if (!isRootSession(agent)) return
-    if (!guardAccess(agent, 'session-start')) return
-    const startup = buildStartupMessage(agent)
-    if (startup) agent.inject(startup)
-  })
-
-  // Claude Code `UserPromptSubmit` equivalent: fire on the first step of a
-  // turn that carries a genuine user message.
-  ctx.on('agent/pre-step', async ({ agent, messages, turn, step, signal }, next) => {
-    const decision = await next()
-    if (decision.kind === 'reject' || signal.aborted) return decision
-    if (step !== 1 || !isRootSession(agent)) return decision
-    if (!guardAccess(agent, 'pre-step')) return decision
-
-    // Claimed inbox messages are not appended to session.events until after
-    // pre-step returns, so the direct prompt must be found in this payload.
-    const userMessage = messages.find((message) => message.source.kind === 'user')
-    if (!userMessage) return decision
-
-    const sessionId = String(agent.session.id)
-    const state = stateFor(sessionId)
-    if (state.countedTurns.has(turn)) return decision
-    state.countedTurns.add(turn)
-    state.userTurns += 1
-
-    // Claim startup only once it can be returned with a genuine user prompt.
-    const startup = buildStartupMessage(agent)
-    const project = projectOf(agent)
-    const lines = [
-      `[hypatia-memory] TRIGGER:log`,
-      `SESSION_ID: ${sessionId}，PROJECT: ${project}，第 ${state.userTurns} 条用户消息`,
-      `按 hypatia-memory skill 的 Conversation Logging Protocol 记录本条用户消息并检查摘要级联；`
-      + `记录是后台任务，完成后正常回复用户，不要向用户提及记录过程。`,
-    ]
-    if (state.userTurns % extractInterval === 0) {
-      lines.push(
-        `TRIGGER:extract —— 同时检查最近对话中是否有已完成的 work unit 需要提取为语义记忆。`,
-      )
-    }
-    if (EXPLICIT_MEMORY_RE.test(messageText(userMessage))) {
-      lines.push(
-        `TRIGGER:immediate —— 用户消息疑似包含显式“记住/忘记”请求，若确认请直接执行对应的语义记忆操作。`,
-      )
-    }
-    return {
-      kind: 'enter',
-      messages: [
-        ...decision.messages,
-        ...(startup ? [startup] : []),
-        pluginMessage(lines.join('\n'), 'hypatia-memory：记录用户消息'),
-      ],
-    }
-  })
-
-  // Claude Code `Stop` equivalent: queue logging of the assistant reply; the
-  // pending context is claimed at the next pre-step (or after resume).
-  ctx.on('agent/turn-stopping', ({ agent }) => {
-    if (!isRootSession(agent)) return
-    if (!guardAccess(agent, 'turn-stopping')) return
-    const sessionId = String(agent.session.id)
-    const state = states.get(sessionId)
-    if (!state || state.userTurns === 0) return
-    agent.inject(pluginMessage(
-      `[hypatia-memory] TRIGGER:log（assistant）\n`
-      + `SESSION_ID: ${sessionId}，PROJECT: ${projectOf(agent)}\n`
-      + `按 hypatia-memory skill 记录上一轮助手回复（msg-${sessionId}-<TURN>）并检查摘要级联；`
-      + `这是后台记录任务，无需回复用户。`,
-      'hypatia-memory：记录助手回复',
-    ))
-  })
 }
 
-/** @param {import('@deepseek-ai/cordis').Context} ctx */
-export function apply(ctx, config = {}) {
-  if (!hypatiaAvailable()) {
-    warn(ctx, '`hypatia` CLI not found on PATH — skills and memory bridge disabled. '
-      + 'Install hypatia (https://github.com/MarchLiu/hypatia) and restart dsh to enable.')
+/**
+ * @param {import('@deepseek-ai/cordis').Context} ctx
+ * @param {object} rawConfig cordis `config:` row
+ */
+export async function apply(ctx, rawConfig = {}) {
+  const warn = makeWarn(ctx)
+  const config = normalizeConfig(rawConfig)
+
+  if (config.registerSkills) {
+    try {
+      registerSkills(ctx, { skillsDir: SKILLS_DIR, warn })
+    } catch (error) {
+      warn(`skill registration failed: ${error.message}`)
+    }
+  }
+
+  if (config.extraction.requested) {
+    warn('extraction.enabled is not available: background model-assisted extraction is '
+      + 'gated NO-GO in GOAL.md until the fault and security tests for Phases 0-2 pass.')
+  }
+
+  // --- deprecated compatibility mode -----------------------------------
+  //
+  // Registered before the host path's gates, not after. The bridge does not
+  // use the policy, the adapter, or the ledger, and the configurations an
+  // operator would pair it with - `memory.preset: 'disabled'`, or a host
+  // without the CLI - are exactly the ones that return early below. Behind
+  // those returns, `legacyBridge.enabled: true` would be silently ignored.
+  if (config.legacyBridge.enabled) {
+    warn('legacyBridge is enabled: the deprecated TRIGGER/Bash memory protocol is active '
+      + 'alongside the host adapter. It injects protocol text into the durable transcript '
+      + 'and has no durable receipts. Disable it once the host path is verified.')
+    registerMemoryBridge(ctx, { extractInterval: config.legacyBridge.extractInterval, name, warn })
+  }
+
+  const policy = createMemoryPolicy({ ...config.memory, warn })
+  if (!policy.enabled) {
+    warn('memory policy grants no capabilities - skills are registered, memory is inactive.')
     return
   }
-  if (config.registerSkills !== false) registerSkills(ctx)
-  if (config.memoryBridge !== false) {
-    registerMemoryBridge(ctx, {
-      extractInterval: Number.isSafeInteger(config.extractInterval) && config.extractInterval > 0
-        ? config.extractInterval
-        : 5,
+
+  // The adapter is the gate: without a usable CLI there is no memory backend,
+  // and the plugin degrades to skills rather than failing the session.
+  const adapter = await createAdapter({ config, warn })
+  if (!adapter) return
+
+  let ledger
+  try {
+    ledger = openLedger(config.state.file)
+  } catch (error) {
+    warn(`could not open the control ledger at ${config.state.file}: ${error.message} `
+      + '- memory is inactive.')
+    return
+  }
+
+  const shelf = config.adapter.shelf
+  const mutations = new MutationCoordinator({ ledger, adapter, shelf, warn })
+  const recall = new RecallService({ ledger, adapter, policy, config, warn })
+
+  /** Host-derived scope for an agent. Never model-supplied. */
+  const scopeOf = (agent) => deriveProjectIdentity({
+    cwd: agent?.session?.header?.cwd ?? null,
+    configuredProjectId: config.projectId,
+  }).scope
+
+  // Settle anything a previous process left mid-flight. Deliberately not
+  // awaited: startup must not block on subprocesses.
+  if (policy.can(Capability.SEMANTIC_WRITE)) {
+    mutations.reconcile()
+      .then((summary) => {
+        if (summary.checked > 0) {
+          warn(`startup reconciliation: ${JSON.stringify(summary)}`)
+        }
+      })
+      .catch((error) => warn(`startup reconciliation failed: ${error.message}`))
+  }
+
+  // --- same-request recall ---------------------------------------------
+  //
+  // Runs after downstream listeners so their decision is preserved, and
+  // appends at most one message to the accepted decision.
+  ctx.on('agent/pre-step', async ({ agent, messages, step, signal }, next) => {
+    const decision = await next()
+    if (decision.kind === 'reject' || signal?.aborted) return decision
+    if (step !== 1 || !isRootSession(agent)) return decision
+    if (!config.recall.enabled || !policy.can(Capability.READ_RECALL)) return decision
+
+    try {
+      // Only direct human text seeds the query. Plugin notices, tool results,
+      // and prior recall are excluded so recall cannot feed on itself.
+      const queryText = messages
+        .filter((message) => message.source?.kind === 'user')
+        .map(messageText)
+        .join('\n')
+        .trim()
+      if (!queryText) return decision
+
+      const scope = scopeOf(agent)
+      const { entries, degraded } = await recall.recall({ scope, shelf, queryText, signal })
+      if (degraded) warn(`recall degraded: ${degraded}`)
+      if (entries.length === 0) return decision
+
+      return {
+        kind: 'enter',
+        messages: [...decision.messages, recallMessage(recall.renderText(entries, { scope }))],
+      }
+    } catch (error) {
+      // Recall never fails a user's turn.
+      warn(`recall failed open: ${error.message}`)
+      return decision
+    }
+  })
+
+  // --- per-agent installation ------------------------------------------
+
+  const installed = new Map()
+
+  const installPerAgent = () => ctx.on('agent/created', ({ agent }) => {
+    if (installed.has(agent) || !isRootSession(agent)) return
+    const roots = ctx.agents?.roots?.()
+    if (Array.isArray(roots) && !roots.includes(agent)) return
+
+    const scope = scopeOf(agent)
+    const header = agent.session?.header ?? {}
+    const disposers = []
+
+    if (config.registerTools && agent.ctx?.tools) {
+      disposers.push(registerMemoryTools({
+        agentCtx: agent.ctx,
+        ledger,
+        adapter,
+        mutations,
+        policy,
+        config,
+        scope,
+        shelf,
+        sessionId: String(header.id ?? agent.session?.id ?? ''),
+        sessionCreatedAt: header.createdAt ?? 0,
+        warn,
+      }))
+    }
+
+    if (config.ingest.compaction) {
+      disposers.push(registerCompactionIngest({
+        ctx, agent, ledger, mutations, policy, scope, shelf, warn,
+      }))
+    }
+
+    installed.set(agent, () => {
+      for (const dispose of disposers.splice(0)) {
+        try {
+          dispose()
+        } catch {
+          // A registry already torn down is not worth surfacing.
+        }
+      }
     })
+  })
+
+  const trackDisposal = () => ctx.on('agent/disposed', ({ agent }) => {
+    installed.get(agent)?.()
+    installed.delete(agent)
+  })
+
+  // Cordis owns teardown through `effect`. Registering the agent listeners
+  // inside it means unloading the plugin also closes the ledger and disposes
+  // every per-agent registration, with no separate dispose bookkeeping.
+  const installMemory = () => {
+    const stopCreated = installPerAgent()
+    const stopDisposed = trackDisposal()
+    return () => {
+      stopCreated()
+      stopDisposed()
+      for (const dispose of installed.values()) dispose()
+      installed.clear()
+      try {
+        ledger.close()
+      } catch {
+        // Closing an already-closed database is not worth surfacing.
+      }
+    }
+  }
+
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(installMemory, 'dsh-hypatia.memory()')
+  } else {
+    // No effect seam (older host or a test double): still install, and accept
+    // that teardown is the process's responsibility.
+    installMemory()
   }
 }
+
+/**
+ * Re-exported for the legacy bridge's own tests and for operators pinning the
+ * compatibility mode. New code should not call this.
+ * @deprecated use the host adapter path; see GOAL.md "Current Compatibility Bridge".
+ */
+export { registerMemoryBridge }

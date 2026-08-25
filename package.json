@@ -1,7 +1,7 @@
 {
   "name": "dsh-hypatia",
   "version": "0.1.0",
-  "description": "Hypatia skills for DeepSeek Harness: knowledge-graph query skill plus automatic conversation-memory bridge. Requires the `hypatia` CLI on PATH.",
+  "description": "Long-term memory for DeepSeek Harness backed by Hypatia: a host-side CLI adapter, a plugin-owned SQLite control ledger, same-request recall, and narrow memory tools. Requires the `hypatia` CLI on PATH.",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
@@ -13,17 +13,23 @@
   ],
   "files": [
     "index.js",
+    "src",
     "cordis.patch.yml",
     "skills",
+    "GOAL.md",
     "README.md",
     "README.zh.md"
   ],
   "scripts": {
-    "test": "node --test tests/**/*.spec.js"
+    "test": "node --disable-warning=ExperimentalWarning --test 'tests/**/*.spec.js'",
+    "bench": "node --disable-warning=ExperimentalWarning scripts/bench-recall.js"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "engines": {
+    "node": ">=22.5.0"
   }
 }
