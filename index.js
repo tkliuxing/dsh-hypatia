@@ -174,8 +174,10 @@ export async function apply(ctx, rawConfig = {}) {
   }).scope
 
   // Settle anything a previous process left mid-flight. Deliberately not
-  // awaited: startup must not block on subprocesses.
-  if (policy.can(Capability.SEMANTIC_WRITE)) {
+  // awaited: startup must not block on subprocesses. Gated by the same
+  // capability as `memory_reconcile`, so the automatic and manual paths to one
+  // operation cannot disagree about who may run it.
+  if (policy.can(Capability.RECONCILE)) {
     mutations.reconcile()
       .then((summary) => {
         if (summary.checked > 0) {

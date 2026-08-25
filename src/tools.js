@@ -573,9 +573,15 @@ export function registerMemoryTools(deps) {
           pending_operations: status.pendingOperations,
           retry_queue: status.retryQueue,
           dead_letters: status.deadLetters,
+          // Only point at a tool this deployment can actually run: advising an
+          // action that always returns "unauthorized" is a dead end the model
+          // will loop on.
           note: uncertain > 0
             ? 'Some operations are unverified; index state for those entries is degraded. '
-              + 'Run memory_reconcile or report this to the user.'
+              + (policy.can(Capability.RECONCILE)
+                ? 'Run memory_reconcile to settle them.'
+                : 'This deployment cannot reconcile from a tool; report it to the user, '
+                  + 'who can restart the session to trigger the startup pass.')
             : 'All tracked operations are verified against the knowledge base.',
         }
       } catch (error) {
@@ -589,7 +595,7 @@ export function registerMemoryTools(deps) {
 
   register({
     name: 'memory_reconcile',
-    description: 'Administrative: re-check every unverified memory operation against the '
+    description: 'Re-check every unverified memory operation against the '
       + 'knowledge base and settle it. Use only when memory_status reports pending, '
       + 'uncertain, or unfinished cleanup work.',
     parameters: { type: 'object', additionalProperties: false, properties: {} },
@@ -614,7 +620,7 @@ export function registerMemoryTools(deps) {
     },
     async execute(_args, exec) {
       try {
-        policy.require(Capability.ADMINISTER)
+        policy.require(Capability.RECONCILE)
         if (!mutations) {
           return { error: 'unavailable', message: 'hypatia adapter is not available' }
         }

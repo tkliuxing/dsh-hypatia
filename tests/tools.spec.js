@@ -334,11 +334,33 @@ describe('status and reconcile', () => {
     ledger.close()
   })
 
-  it('requires the administer capability to reconcile', async () => {
+  it('lets the default preset settle its own unverified operations', async () => {
+    // `standard` authorizes the writes, so it must be able to finish them.
+    // Gating reconcile behind ADMINISTER stranded every uncertain operation on
+    // the default preset, with memory_status pointing at a tool that always
+    // refused.
     const { call, ledger } = setup({ preset: 'standard' })
     const result = await call('memory_reconcile')
 
+    assert.equal(result.error, undefined)
+    assert.equal(typeof result.checked, 'number')
+    ledger.close()
+  })
+
+  it('refuses to reconcile when the capability is withheld', async () => {
+    const { call, ledger } = setup({ preset: 'read-only-recall' })
+    const result = await call('memory_reconcile')
+
     assert.equal(result.error, 'unauthorized')
+    ledger.close()
+  })
+
+  it('does not advise a tool this deployment cannot run', async () => {
+    const { call, ledger } = setup({ preset: 'read-only-recall' })
+    const status = await call('memory_status')
+
+    assert.ok(!status.note?.includes('Run memory_reconcile'),
+      'advice the caller cannot act on is a dead end')
     ledger.close()
   })
 })

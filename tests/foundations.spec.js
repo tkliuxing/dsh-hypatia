@@ -142,6 +142,17 @@ describe('memory authorization', () => {
     assert.ok(!full.can(Capability.GLOBAL_RULE_WRITE, { automatic: true }), 'never for automatic use')
   })
 
+  it('grants reconcile wherever it grants the writes reconcile settles', () => {
+    // The startup pass and `memory_reconcile` are the same operation; if one
+    // capability governed the automatic path and another the manual one, a
+    // default deployment could dispatch writes it could never settle.
+    const standard = createMemoryPolicy({ preset: 'standard' })
+
+    assert.ok(standard.can(Capability.SEMANTIC_WRITE))
+    assert.ok(standard.can(Capability.RECONCILE))
+    assert.ok(!standard.can(Capability.ADMINISTER), 'shelf administration stays separate')
+  })
+
   it('keeps transcript mirroring off even when configured on', () => {
     const warnings = []
     const policy = createMemoryPolicy({

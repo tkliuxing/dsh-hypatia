@@ -129,8 +129,8 @@ Memory capabilities are **independent of the DSH file sandbox**. `read-only`, `w
 |---|---|
 | `disabled` | nothing |
 | `read-only-recall` | recall only |
-| `standard` (default) | recall, semantic write, delete |
-| `full` | adds global-rule write and administration |
+| `standard` (default) | recall, semantic write, delete, reconcile |
+| `full` | adds global-rule write and shelf administration |
 
 Global-rule writes and transcript mirroring are never available to automatic paths, whatever the preset says.
 

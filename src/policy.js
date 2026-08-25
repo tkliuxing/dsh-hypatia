@@ -22,9 +22,21 @@ export const Capability = {
   TRANSCRIPT_MIRROR: 'transcript-mirror',
   /** Tombstone and clean up plugin-owned records. */
   DELETE: 'delete',
+  /**
+   * Settle operations this plugin already dispatched: read a stable key back,
+   * commit its receipt, finish an interrupted cleanup.
+   *
+   * Separate from ADMINISTER on purpose. Reconciliation completes work that
+   * SEMANTIC_WRITE and DELETE already authorized and touches only records the
+   * ledger owns - unlike connect/export/archive, which reach the shelf itself.
+   * Bundling it with those would leave a default deployment unable to settle
+   * its own uncertain writes, so the retry machinery would record failures it
+   * could never clear.
+   */
+  RECONCILE: 'reconcile',
   /** Write rules/taboos at global scope. Never granted to automatic extraction. */
   GLOBAL_RULE_WRITE: 'global-rule-write',
-  /** Shelf connect/export/archive and explicit reconcile runs. */
+  /** Shelf connect, export, and archive - operations that reach the shelf itself. */
   ADMINISTER: 'administer',
 }
 
@@ -32,11 +44,17 @@ export const Capability = {
 const PRESETS = {
   disabled: [],
   'read-only-recall': [Capability.READ_RECALL],
-  standard: [Capability.READ_RECALL, Capability.SEMANTIC_WRITE, Capability.DELETE],
+  standard: [
+    Capability.READ_RECALL,
+    Capability.SEMANTIC_WRITE,
+    Capability.DELETE,
+    Capability.RECONCILE,
+  ],
   full: [
     Capability.READ_RECALL,
     Capability.SEMANTIC_WRITE,
     Capability.DELETE,
+    Capability.RECONCILE,
     Capability.GLOBAL_RULE_WRITE,
     Capability.ADMINISTER,
   ],
