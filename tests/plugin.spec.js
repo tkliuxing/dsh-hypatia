@@ -64,8 +64,27 @@ afterEach(() => {
 describe('plugin metadata', () => {
   it('declares its name and required services', () => {
     assert.equal(name, 'dsh-hypatia')
-    assert.deepEqual(inject.required, ['skills', 'agents'])
-    assert.ok(inject.optional.includes('tools'))
+    assert.deepEqual(inject, ['skills', 'agents'])
+  })
+
+  it('declares inject as a flat array of service names', () => {
+    // Cordis reads the normalized form with `Object.keys(fiber.inject)`, so an
+    // object like {required: [...], optional: [...]} is taken as two services
+    // named "required" and "optional". They never resolve, the entry stays
+    // pending, and the entire profile boot fails - observed for real:
+    //   dsh-hypatia: pending (waiting for services: required, optional)
+    assert.ok(Array.isArray(inject), 'inject must be an array, never an object')
+    for (const service of inject) {
+      assert.equal(typeof service, 'string', `inject entry ${String(service)} must be a service name`)
+    }
+  })
+
+  it('requires only services every profile provides', () => {
+    // A service listed here that a profile lacks is a hard boot failure for
+    // the whole profile, so `tools` and `sandboxPolicy` stay out: both degrade
+    // cleanly when absent.
+    assert.ok(!inject.includes('tools'))
+    assert.ok(!inject.includes('sandboxPolicy'))
   })
 })
 

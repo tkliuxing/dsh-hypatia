@@ -45,14 +45,23 @@ import { registerMemoryTools } from './src/tools.js'
 export const name = 'dsh-hypatia'
 
 /**
- * Services this plugin needs before it can install anything. `tools` is
- * required for the narrow memory tools; without it the plugin still provides
- * skills and recall.
+ * Services that must exist before this plugin activates.
+ *
+ * Must stay a flat array of service names. Cordis reads the normalized form
+ * with `Object.keys(fiber.inject)`, so an object like
+ * `{required: [...], optional: [...]}` is read as two services literally named
+ * "required" and "optional" - which never resolve, leaving the entry pending
+ * and failing the whole profile boot with:
+ *
+ *   dsh-hypatia: pending (waiting for services: required, optional)
+ *
+ * Keep this list to services every profile really has. `tools` and
+ * `sandboxPolicy` are deliberately absent: a missing service here is a hard
+ * boot failure for the entire profile, whereas both of those degrade cleanly
+ * (tools warn and are skipped; the legacy bridge treats an absent sandbox
+ * policy as unrestricted, as it always has).
  */
-export const inject = {
-  required: ['skills', 'agents'],
-  optional: ['tools', 'sandboxPolicy'],
-}
+export const inject = ['skills', 'agents']
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const SKILLS_DIR = join(PLUGIN_DIR, 'skills')
@@ -224,6 +233,14 @@ export async function apply(ctx, rawConfig = {}) {
     const scope = scopeOf(agent)
     const header = agent.session?.header ?? {}
     const disposers = []
+
+    // `tools` is not injected (see `inject` above), so its absence must be
+    // reported rather than silently costing the model every memory tool.
+    if (config.registerTools && !agent.ctx?.tools) {
+      warn('the `tools` service is unavailable for this agent - memory_search, '
+        + 'memory_remember, and memory_forget_* are not registered. Recall and '
+        + 'compaction ingestion still work.')
+    }
 
     if (config.registerTools && agent.ctx?.tools) {
       disposers.push(registerMemoryTools({
