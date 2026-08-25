@@ -20,6 +20,7 @@ import {
   deriveOperationId,
   memoryName,
   sourceIdentityOf,
+  sourceRangeKey,
 } from '../identity.js'
 import { RECALL_BLOCK_END, RECALL_BLOCK_START } from '../recall.js'
 import { truncateBytes } from '../redaction.js'
@@ -117,10 +118,10 @@ export function registerCompactionIngest({ ctx, agent, ledger, mutations, policy
   let queue = Promise.resolve()
   let disposed = false
 
-  const enqueue = (event, range) => {
+  const enqueue = (event, span) => {
     queue = queue
       .then(() => (disposed ? undefined : ingestOne({
-        event, range, sourceIdentity, seedLength, header,
+        event, span, sourceIdentity, seedLength, header,
         ledger, mutations, scope, shelf, warn,
       })))
       .catch((error) => warn(`compaction ingest failed: ${error.message}`))
@@ -128,9 +129,9 @@ export function registerCompactionIngest({ ctx, agent, ledger, mutations, policy
 
   const dispose = ctx.on('session/event', (session, event) => {
     if (session !== agent.session) return
-    const range = ingestableRange(event, seedLength)
-    if (!range) return
-    enqueue(event, range)
+    const span = ingestableSpan(event, seedLength)
+    if (!span) return
+    enqueue(event, span)
   })
 
   // Catch up on summaries this plugin was not running to observe: a resumed
@@ -150,27 +151,53 @@ export function registerCompactionIngest({ ctx, agent, ledger, mutations, policy
 }
 
 /**
- * The shadowed range this event should be ingested for, or null when it is not
- * an ingestable compaction summary.
+ * The source span this event should be ingested for, or null when it is not an
+ * ingestable compaction summary.
  *
- * `seq` is the event's own position in the session log; `shadowedRange` is the
- * span of events it replaced. They are different number spaces, so the fork
- * boundary is checked against `seq` and ingestion progress against the range.
+ * Built from `shadowedSeqs`, which DSH documents as the authoritative set of
+ * shadowed nodes. `shadowedRange` is deliberately not used as identity: it is
+ * a surface-POSITION span whose `start` can exceed its `end` once a
+ * replacement summary node lands at an older range's position, and two
+ * compactions can share a bounding pair while shadowing different nodes.
+ *
+ * `seq` is the event's own position in the session log, a third number space
+ * again - so the fork boundary is checked against it, and nothing else is.
+ *
+ * @returns {{key: string, first: number, last: number, count: number}|null}
  */
-function ingestableRange(event, seedLength) {
+function ingestableSpan(event, seedLength) {
   if (event?.type !== 'compaction/summary') return null
   if (typeof event.seq === 'number' && event.seq < seedLength) return null
-  const range = event.data?.shadowedRange
-  if (!range || typeof range.start !== 'number' || typeof range.end !== 'number') return null
-  return range
+
+  // `shadowedSeqs` is a required field of the event. An event without it is
+  // malformed, and there is no weaker key worth substituting: deriving one
+  // from `shadowedRange` would reintroduce exactly the collision this function
+  // exists to prevent. Skip it instead, so the gap is visible rather than
+  // silently half-ingested under an unsound identity.
+  const seqs = event.data?.shadowedSeqs
+  if (!Array.isArray(seqs) || seqs.length === 0) return null
+  if (!seqs.every((n) => typeof n === 'number' && Number.isFinite(n))) return null
+
+  const sorted = [...seqs].sort((a, b) => a - b)
+  return {
+    key: sourceRangeKey(sorted),
+    first: sorted[0],
+    last: sorted[sorted.length - 1],
+    count: sorted.length,
+  }
 }
 
 /**
  * Queue every already-logged summary the cursor has not accounted for.
  *
- * The cursor stores the highest `shadowedRange.end` that reached `applied`.
- * Compacted ranges advance monotonically, so anything at or below it is
- * settled and can be skipped without a per-range database lookup.
+ * The cursor stores the highest shadowed sequence number that reached
+ * `applied`. A compaction always shadows the newest content, so a summary
+ * whose highest shadowed seq is at or below the cursor lies entirely inside
+ * settled territory and can be skipped without a database lookup.
+ *
+ * That is an optimization, not the correctness boundary: `ingestOne` still
+ * checks the exact range key, so anything the cursor lets through is
+ * deduplicated properly.
  */
 function catchUp({ agent, ledger, sourceIdentity, seedLength, enqueue, warn }) {
   let events
@@ -192,30 +219,37 @@ function catchUp({ agent, ledger, sourceIdentity, seedLength, enqueue, warn }) {
 
   let queued = 0
   for (const event of events) {
-    const range = ingestableRange(event, seedLength)
-    if (!range || range.end <= lastAppliedSeq) continue
-    enqueue(event, range)
+    const span = ingestableSpan(event, seedLength)
+    if (!span || span.last <= lastAppliedSeq) continue
+    enqueue(event, span)
     queued += 1
   }
   if (queued > 0) warn(`compaction catch-up queued ${queued} summaries logged before this load`)
 }
 
 /** Write one compaction summary as a plugin-owned memory, exactly once. */
-async function ingestOne({ event, range, sourceIdentity, seedLength, header, ledger, mutations, scope, shelf, warn }) {
+async function ingestOne({ event, span, sourceIdentity, seedLength, header, ledger, mutations, scope, shelf, warn }) {
   const raw = blocksToText(event.data?.summary)
   const text = truncateBytes(stripDerivedContext(raw), MAX_SUMMARY_BYTES)
   if (!text) return
 
   const kind = 'summary'
-  const memoryId = deriveMemoryId({ sourceIdentity, fromSeq: range.start, throughSeq: range.end, kind })
+  // Identity comes from the exact shadowed set. `first`/`last` are retained
+  // for provenance and display only - they are real sequence numbers, but they
+  // do not identify the set.
+  const memoryId = deriveMemoryId({
+    sourceIdentity, fromSeq: span.first, throughSeq: span.last, kind, rangeKey: span.key,
+  })
 
-  // Cheap pre-check: a completed ingest for this exact range needs no CLI call.
-  const existing = ledger.findBySourceRange({ sourceIdentity, fromSeq: range.start, throughSeq: range.end })
+  // Cheap pre-check: a completed ingest for this exact set needs no CLI call.
+  const existing = ledger.findBySourceRange({ sourceIdentity, rangeKey: span.key })
   if (existing && existing.state === 'applied') return
 
   const operationId = deriveOperationId({
-    sourceIdentity, fromSeq: range.start, throughSeq: range.end, kind,
+    sourceIdentity, fromSeq: span.first, throughSeq: span.last, kind, rangeKey: span.key,
   })
+
+  const title = `Conversation summary (${span.count} events, ${span.first}-${span.last})`
 
   const result = await mutations.writeMemory({
     operationId,
@@ -223,12 +257,8 @@ async function ingestOne({ event, range, sourceIdentity, seedLength, header, led
     hypatiaName: memoryName(scope, memoryId),
     scope,
     kind,
-    title: `Conversation summary (events ${range.start}-${range.end})`,
-    payload: {
-      title: `Conversation summary (events ${range.start}-${range.end})`,
-      summary: text,
-      kind,
-    },
+    title,
+    payload: { title, summary: text, kind },
     // Machine-derived, so it never carries user-confirmed authority.
     trust: 'derived',
     provenance: buildProvenance({
@@ -239,13 +269,14 @@ async function ingestOne({ event, range, sourceIdentity, seedLength, header, led
       revisionAtExtraction: String(event.data?.compactionId ?? 'unknown'),
       parentSession: header.parentSession ?? null,
       seedLength,
-      fromSeq: range.start,
-      throughSeq: range.end,
+      fromSeq: span.first,
+      throughSeq: span.last,
     }),
     sourceIdentity,
     sessionId: String(header.id ?? ''),
-    fromSeq: range.start,
-    throughSeq: range.end,
+    fromSeq: span.first,
+    throughSeq: span.last,
+    rangeKey: span.key,
   })
 
   if (result.status === 'applied' || result.status === 'replayed') {
@@ -254,9 +285,9 @@ async function ingestOne({ event, range, sourceIdentity, seedLength, header, led
       sessionId: String(header.id ?? ''),
       parentSession: header.parentSession ?? null,
       seedLength,
-      lastAppliedSeq: range.end,
+      lastAppliedSeq: span.last,
     })
   } else {
-    warn(`compaction summary ${range.start}-${range.end} not confirmed stored (${result.status})`)
+    warn(`compaction summary ${span.first}-${span.last} not confirmed stored (${result.status})`)
   }
 }

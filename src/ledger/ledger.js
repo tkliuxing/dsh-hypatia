@@ -203,12 +203,12 @@ export class Ledger {
         this.db.prepare(`
           INSERT OR IGNORE INTO memory_provenance (
             memory_id, source_identity, session_id, from_seq, through_seq, turn,
-            provenance_json, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            provenance_json, created_at, source_range_key
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           intent.memoryId, intent.sourceIdentity ?? '', intent.sessionId ?? null,
           intent.fromSeq ?? 0, intent.throughSeq ?? 0, intent.turn ?? 0,
-          canonicalJson(intent.provenance), timestamp,
+          canonicalJson(intent.provenance), timestamp, intent.rangeKey ?? '',
         )
       }
 
@@ -359,13 +359,21 @@ export class Ledger {
     return row !== undefined
   }
 
-  /** Look up an existing memory for a source range, for idempotent ingestion. */
-  findBySourceRange({ sourceIdentity, fromSeq, throughSeq }) {
+  /**
+   * Look up an existing memory for an exact source range, for idempotent
+   * ingestion.
+   *
+   * Matches on `source_range_key` - the digest of the authoritative shadowed
+   * sequence set - rather than a `from`/`through` pair, because that pair is a
+   * surface-position span that two different compactions can share.
+   */
+  findBySourceRange({ sourceIdentity, rangeKey }) {
+    if (!rangeKey) return undefined
     return this.db.prepare(`
       SELECT r.* FROM memory_record r
         JOIN memory_provenance p ON p.memory_id = r.memory_id
-       WHERE p.source_identity = ? AND p.from_seq = ? AND p.through_seq = ?
-    `).get(sourceIdentity, fromSeq, throughSeq)
+       WHERE p.source_identity = ? AND p.source_range_key = ?
+    `).get(sourceIdentity, rangeKey)
   }
 
   // --- deletion ---------------------------------------------------------

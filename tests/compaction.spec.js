@@ -25,15 +25,17 @@ function makeAgent({ id = 'session-1', cwd = '/work/a', origin, seedLength = 0, 
   return { session, ctx: new FakeContext() }
 }
 
-function summaryEvent({ start, end, text, seq = 100, compactionId = 'c1' }) {
+function summaryEvent({ start, end, text, seq = 100, compactionId = 'c1', shadowedSeqs }) {
   return {
     type: 'compaction/summary',
     seq,
     data: {
       compactionId,
       summary: [{ type: 'text', text }],
+      // A surface-position span: DSH allows start > end, and it is not the
+      // authoritative set. Tests that care pass shadowedSeqs explicitly.
       shadowedRange: { start, end },
-      shadowedSeqs: [start, end],
+      shadowedSeqs: shadowedSeqs ?? [start, end],
       shadowedTokenCount: 1000,
       provider: 'test',
       model: 'test-model',
@@ -294,6 +296,85 @@ describe('startup catch-up', () => {
       scope: SCOPE, shelf: 'default', warn: () => {},
     }))
     await drain()
+    assert.equal(adapter.knowledge.size, 0)
+    ledger.close()
+  })
+})
+
+describe('source identity', () => {
+  it('separates compactions that share a bounding pair but shadow different nodes', async () => {
+    const { ledger, adapter, deliver } = setup()
+
+    // Same shadowedRange, different authoritative sets. Keying on the pair
+    // would collapse these onto one memory and silently drop the second.
+    await deliver(summaryEvent({ start: 1, end: 9, shadowedSeqs: [1, 4, 9], text: 'First pass.' }))
+    await deliver(summaryEvent({
+      start: 1, end: 9, shadowedSeqs: [1, 5, 9], text: 'Different nodes.', compactionId: 'c2', seq: 101,
+    }))
+
+    assert.equal(adapter.knowledge.size, 2, 'distinct shadowed sets are distinct memories')
+    assert.equal(ledger.db.prepare('SELECT COUNT(*) AS c FROM memory_record').get().c, 2)
+    ledger.close()
+  })
+
+  it('still deduplicates an identical shadowed set regardless of seq order', async () => {
+    const { ledger, adapter, deliver } = setup()
+
+    await deliver(summaryEvent({ start: 1, end: 9, shadowedSeqs: [9, 1, 4], text: 'Same set.' }))
+    await deliver(summaryEvent({
+      start: 1, end: 9, shadowedSeqs: [1, 4, 9], text: 'Same set.', compactionId: 'c2', seq: 101,
+    }))
+
+    assert.equal(adapter.knowledge.size, 1)
+    ledger.close()
+  })
+
+  it('tolerates an inverted shadowedRange, which DSH permits', async () => {
+    const { ledger, adapter, deliver } = setup()
+
+    // start > end happens once a replacement summary node lands at an older
+    // range's position. Ordering must come from the seq set, not the pair.
+    await deliver(summaryEvent({ start: 340, end: 12, shadowedSeqs: [12, 40, 340], text: 'Inverted span.' }))
+
+    assert.equal(adapter.knowledge.size, 1)
+    const record = ledger.recallCandidates({ scope: SCOPE, shelf: 'default' })[0]
+    assert.match(record.title, /3 events, 12-340/, 'display must be ordered, never "340-12"')
+
+    const provenance = ledger.db.prepare('SELECT from_seq, through_seq FROM memory_provenance').get()
+    assert.equal(provenance.from_seq, 12)
+    assert.equal(provenance.through_seq, 340)
+    ledger.close()
+  })
+
+  it('advances the cursor by the highest shadowed seq, not the range end', async () => {
+    const { ledger, deliver } = setup()
+    await deliver(summaryEvent({ start: 340, end: 12, shadowedSeqs: [12, 40, 340], text: 'Inverted span.' }))
+
+    assert.equal(ledger.db.prepare('SELECT last_applied_seq AS s FROM session_cursor').get().s, 340)
+    ledger.close()
+  })
+
+  it('records the exact range key so the dedup lookup is not approximate', async () => {
+    const { ledger, deliver } = setup()
+    await deliver(summaryEvent({ start: 1, end: 9, shadowedSeqs: [1, 4, 9], text: 'Keyed.' }))
+
+    const key = ledger.db.prepare('SELECT source_range_key AS k FROM memory_provenance').get().k
+    assert.ok(key && key.length > 0, 'provenance must carry the authoritative range key')
+    ledger.close()
+  })
+
+  it('skips an event carrying no authoritative shadowed set', async () => {
+    const { ledger, adapter, deliver } = setup()
+
+    // shadowedSeqs is a required field. Substituting a weaker key from
+    // shadowedRange would reintroduce the collision this guards against.
+    await deliver({
+      type: 'compaction/summary',
+      seq: 50,
+      data: { compactionId: 'c9', summary: [{ type: 'text', text: 'No seqs.' }], shadowedRange: { start: 1, end: 9 } },
+    })
+    await deliver(summaryEvent({ start: 1, end: 9, shadowedSeqs: [], text: 'Empty seqs.', seq: 51 }))
+
     assert.equal(adapter.knowledge.size, 0)
     ledger.close()
   })

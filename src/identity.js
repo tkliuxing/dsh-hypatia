@@ -118,8 +118,29 @@ export function nameMatchesScope(name, scope) {
  * Deterministic memory ID for source-derived memories, so the same source
  * range never yields a second record after a crash or duplicate notification.
  */
-export function deriveMemoryId({ sourceIdentity, fromSeq, throughSeq, kind }) {
-  return digest('memory', sourceIdentity, fromSeq, throughSeq, kind).slice(0, 24)
+export function deriveMemoryId({ sourceIdentity, fromSeq, throughSeq, kind, rangeKey = '' }) {
+  return digest('memory', sourceIdentity, fromSeq, throughSeq, kind, rangeKey).slice(0, 24)
+}
+
+/**
+ * Stable key for the exact set of source events a memory derives from.
+ *
+ * A `from`/`through` pair is not a safe identity for compaction summaries.
+ * DSH's `shadowedRange` is a surface-POSITION span rather than a numeric seq
+ * interval - `start` can exceed `end` once a replacement summary node lands at
+ * an older range's position - and `shadowedSeqs` is documented as the
+ * authoritative set. Two compactions can therefore share a bounding pair while
+ * shadowing different nodes, which would collapse them onto one memory ID and
+ * silently drop the second summary.
+ *
+ * Hashing the exact sorted set removes both hazards.
+ *
+ * @param {number[]} seqs the authoritative shadowed sequence numbers
+ * @returns {string} stable key, or '' when the set is empty
+ */
+export function sourceRangeKey(seqs) {
+  if (!Array.isArray(seqs) || seqs.length === 0) return ''
+  return digest('range', [...seqs].sort((a, b) => a - b).join(',')).slice(0, 24)
 }
 
 /**
@@ -132,12 +153,13 @@ export function deriveOperationId({
   fromSeq,
   throughSeq,
   kind,
+  rangeKey = '',
   verb = 'create',
   extractorVersion = EXTRACTOR_VERSION,
   proposalSchemaVersion = PROPOSAL_SCHEMA_VERSION,
 }) {
   return digest(
-    'operation', verb, sourceIdentity, fromSeq, throughSeq, kind,
+    'operation', verb, sourceIdentity, fromSeq, throughSeq, kind, rangeKey,
     extractorVersion, proposalSchemaVersion,
   ).slice(0, 32)
 }

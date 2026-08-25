@@ -140,6 +140,21 @@ export const MIGRATIONS = [
       `)
     },
   },
+  {
+    version: 2,
+    up(db) {
+      // `from_seq`/`through_seq` alone cannot identify a compacted source
+      // range: DSH's `shadowedRange` is a surface-position span whose `start`
+      // may exceed its `end`, and two compactions can share a bounding pair
+      // while shadowing different nodes. `source_range_key` carries the digest
+      // of the authoritative `shadowedSeqs` set so the dedup lookup is exact.
+      db.exec(`
+        ALTER TABLE memory_provenance ADD COLUMN source_range_key TEXT NOT NULL DEFAULT '';
+        CREATE INDEX IF NOT EXISTS memory_provenance_range_key
+          ON memory_provenance (source_identity, source_range_key);
+      `)
+    },
+  },
 ]
 
 /** Highest schema version this build knows how to produce. */

@@ -83,6 +83,7 @@ export class MutationCoordinator {
       fromSeq: request.fromSeq ?? 0,
       throughSeq: request.throughSeq ?? 0,
       turn: request.turn ?? 0,
+      rangeKey: request.rangeKey ?? '',
     })
 
     if (begin.status === 'replay' && begin.operation.state === OperationState.APPLIED) {
