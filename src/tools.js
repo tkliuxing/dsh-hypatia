@@ -30,6 +30,10 @@ const MEMORY_KINDS = ['rule', 'taboo', 'decision', 'preference', 'work-unit']
 /** A preview stays usable only briefly, so a stale token cannot authorize a delete. */
 const PREVIEW_TTL_MS = 10 * 60 * 1000
 
+/** How many records a preview examines, and how many it lists. */
+const PREVIEW_SCAN_LIMIT = 500
+const PREVIEW_MAX = 25
+
 const textBlocks = (value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
 
 /** Error shape shared by every tool's output schema. */
@@ -297,13 +301,22 @@ export function registerMemoryTools(deps) {
   register({
     name: 'memory_forget_preview',
     description: 'List exactly which stored memories a forget request would delete. '
-      + 'This only previews - it never deletes. Show the user the list and get their '
-      + 'agreement before calling memory_forget_confirm with the returned token.',
+      + 'This only previews - it never deletes. Show the user the list, including any '
+      + 'entries it reports as left out, and get their agreement before calling '
+      + 'memory_forget_confirm with the returned token.',
     parameters: {
       type: 'object',
       additionalProperties: false,
       properties: {
-        query: { type: 'string', description: 'What the user wants forgotten.' },
+        query: { type: 'string', description: 'What the user wants forgotten. Ignored when match is "all".' },
+        match: {
+          type: 'string',
+          enum: ['terms', 'all'],
+          description: 'How to select candidates. "terms" (default) matches the query against '
+            + 'stored titles and summaries. Use "all" only when the user asked to forget '
+            + "everything in this project - a term search cannot express that, because words "
+            + 'like "everything" do not appear in the memories themselves.',
+        },
       },
       required: ['query'],
     },
@@ -317,9 +330,13 @@ export function registerMemoryTools(deps) {
               preview_token: { type: 'string' },
               candidates: { type: 'array', items: ENTRY_SCHEMA },
               scope: { type: 'string' },
+              matched: { type: 'number' },
+              listed: { type: 'number' },
+              total_in_scope: { type: 'number' },
+              truncated: { type: 'boolean' },
               note: { type: 'string' },
             },
-            required: ['preview_token', 'candidates', 'scope'],
+            required: ['preview_token', 'candidates', 'scope', 'matched', 'listed', 'truncated'],
           },
           ERROR_SCHEMA,
         ],
@@ -330,12 +347,20 @@ export function registerMemoryTools(deps) {
       try {
         policy.require(Capability.DELETE)
         sweepPreviews()
-        const terms = extractTerms(String(args.query ?? ''))
-        if (terms.length === 0) {
-          return { error: 'validation', message: 'query must contain at least one searchable term' }
+
+        const matchAll = args.match === 'all'
+        const terms = matchAll ? [] : extractTerms(String(args.query ?? ''))
+        if (!matchAll && terms.length === 0) {
+          return {
+            error: 'validation',
+            message: 'query must contain at least one searchable term, or pass match:"all" '
+              + 'to preview every memory in this project',
+          }
         }
-        const candidates = ledger
-          .recallCandidates({ scope, shelf, limit: 200 })
+
+        const totalInScope = ledger.countRecallCandidates({ scope, shelf })
+        const scanned = ledger.recallCandidates({ scope, shelf, limit: PREVIEW_SCAN_LIMIT })
+        const matches = scanned
           .map((row) => {
             let payload = null
             try {
@@ -346,11 +371,17 @@ export function registerMemoryTools(deps) {
             const title = row.title ?? payload?.title ?? row.kind
             const summary = typeof payload?.summary === 'string' ? payload.summary : ''
             const haystack = `${title} ${summary}`.toLowerCase()
-            return { row, title, summary, hits: terms.filter((t) => haystack.includes(t)).length }
+            const hits = matchAll ? 1 : terms.filter((term) => haystack.includes(term)).length
+            return { row, title, summary, hits }
           })
           .filter((candidate) => candidate.hits > 0)
-          .sort((a, b) => b.hits - a.hits)
-          .slice(0, 25)
+          .sort((a, b) => b.hits - a.hits || b.row.updated_at - a.row.updated_at)
+
+        const candidates = matches.slice(0, PREVIEW_MAX)
+        // A capped list that claims to be "exactly what will be deleted" is a
+        // lie the user cannot detect: they confirm, believe it is done, and
+        // the rest stay. Report the shortfall instead of hiding it.
+        const truncated = matches.length > candidates.length || totalInScope > scanned.length
 
         const token = randomUUID()
         previews.set(token, {
@@ -358,6 +389,14 @@ export function registerMemoryTools(deps) {
           scope,
           expiresAt: Date.now() + PREVIEW_TTL_MS,
         })
+
+        const note = truncated
+          ? `Nothing has been deleted. This list is INCOMPLETE: ${candidates.length} of `
+            + `${matches.length} matching entries are shown (${totalInScope} exist in this `
+            + 'project). Tell the user the list is partial, confirm these, then preview '
+            + 'again to continue.'
+          : 'Nothing has been deleted. This is the complete set that matched. Confirm with '
+            + 'the user, then pass the exact memory_ids from this list to memory_forget_confirm.'
 
         return {
           preview_token: token,
@@ -370,8 +409,11 @@ export function registerMemoryTools(deps) {
             scope: row.scope,
           })),
           scope,
-          note: 'Nothing has been deleted. Confirm with the user, then pass the exact '
-            + 'memory_ids from this list to memory_forget_confirm.',
+          matched: matches.length,
+          listed: candidates.length,
+          total_in_scope: totalInScope,
+          truncated,
+          note,
         }
       } catch (error) {
         return toolError(error)

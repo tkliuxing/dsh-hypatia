@@ -56,10 +56,22 @@ credential shapes before storage, but that is a backstop, not permission.
 
 Forgetting is two steps, and skipping the first is not possible:
 
-1. `memory_forget_preview` returns the exact entries a request would delete,
-   plus a token. **Show the user that list.**
+1. `memory_forget_preview` returns the entries a request would delete, plus a
+   token. **Show the user that list.**
 2. `memory_forget_confirm` deletes only the IDs from that exact preview. IDs
    outside it are refused.
+
+Two things about the preview you must not gloss over:
+
+- **"Forget everything" needs `match: "all"`.** A term search cannot express
+  it, because words like *everything*, *all*, or *一切* appear nowhere in the
+  stored memories - a plain query returns an empty list that reads as "there is
+  nothing to delete". Check `total_in_scope` before telling the user their
+  project is empty.
+- **`truncated: true` means the list is partial.** Say so. The user is about to
+  confirm a deletion believing it is complete; if `listed` is less than
+  `matched`, tell them the numbers, delete what is shown, then preview again.
+  Never present a capped list as the whole set.
 
 Report the cleanup status you actually receive. `active-shelf-cleanup-complete`
 means deleted and verified in this knowledge base. `cleanup-uncertain` means

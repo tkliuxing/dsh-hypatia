@@ -197,6 +197,129 @@ describe('two-stage forget', () => {
   })
 })
 
+describe('forget coverage and honesty', () => {
+  /** Store `count` distinct memories in the current scope. */
+  async function seedMemories(call, count, prefix = 'Rule') {
+    const ids = []
+    for (let i = 0; i < count; i += 1) {
+      const stored = await call('memory_remember', {
+        kind: 'rule', title: `${prefix} ${i}`, summary: `Distinct guidance number ${i}.`,
+      })
+      ids.push(stored.memory_id)
+    }
+    return ids
+  }
+
+  it('cannot express "forget everything" as a term search', async () => {
+    const { call, ledger } = setup()
+    await seedMemories(call, 3)
+
+    // The words a user says when they mean "all of it" appear in none of the
+    // stored memories, so a term search finds nothing and the empty list reads
+    // as "there is nothing to delete".
+    const preview = await call('memory_forget_preview', { query: 'forget everything' })
+
+    assert.equal(preview.candidates.length, 0)
+    assert.equal(preview.matched, 0)
+    assert.equal(preview.total_in_scope, 3, 'the user must still be told memories exist')
+    ledger.close()
+  })
+
+  it('selects every memory in scope when match is "all"', async () => {
+    const { call, ledger } = setup()
+    await seedMemories(call, 3)
+
+    const preview = await call('memory_forget_preview', { query: 'everything', match: 'all' })
+
+    assert.equal(preview.candidates.length, 3)
+    assert.equal(preview.matched, 3)
+    assert.equal(preview.truncated, false)
+    ledger.close()
+  })
+
+  it('deletes exactly the previewed set when "all" is confirmed', async () => {
+    const { call, adapter, ledger } = setup()
+    await seedMemories(call, 3)
+
+    const preview = await call('memory_forget_preview', { query: 'everything', match: 'all' })
+    const result = await call('memory_forget_confirm', {
+      preview_token: preview.preview_token,
+      memory_ids: preview.candidates.map((entry) => entry.memory_id),
+    })
+
+    assert.equal(result.results.length, 3)
+    assert.deepEqual(result.refused, [])
+    assert.equal(adapter.knowledge.size, 0)
+    assert.equal(ledger.countRecallCandidates({ scope: SCOPE, shelf: 'default' }), 0)
+    ledger.close()
+  })
+
+  it('never silently caps: an over-long list reports the shortfall', async () => {
+    const { call, ledger } = setup()
+    await seedMemories(call, 30)
+
+    const preview = await call('memory_forget_preview', { query: 'everything', match: 'all' })
+
+    assert.equal(preview.listed, 25)
+    assert.equal(preview.matched, 30)
+    assert.equal(preview.total_in_scope, 30)
+    assert.equal(preview.truncated, true, 'a capped list must announce that it is capped')
+    assert.match(preview.note, /INCOMPLETE/)
+    assert.match(preview.note, /25 of 30/)
+    ledger.close()
+  })
+
+  it('marks a complete term match as not truncated', async () => {
+    const { call, ledger } = setup()
+    await seedMemories(call, 2)
+
+    const preview = await call('memory_forget_preview', { query: 'Distinct guidance' })
+
+    assert.equal(preview.truncated, false)
+    assert.match(preview.note, /complete set/)
+    ledger.close()
+  })
+
+  it('confirming a truncated preview leaves the remainder intact and visible', async () => {
+    const { call, ledger } = setup()
+    await seedMemories(call, 30)
+
+    const preview = await call('memory_forget_preview', { query: 'everything', match: 'all' })
+    await call('memory_forget_confirm', {
+      preview_token: preview.preview_token,
+      memory_ids: preview.candidates.map((entry) => entry.memory_id),
+    })
+
+    // The user believed they deleted everything; the tool must still show the
+    // remainder rather than report an empty project.
+    const after = await call('memory_forget_preview', { query: 'everything', match: 'all' })
+    assert.equal(after.total_in_scope, 5)
+    assert.equal(after.matched, 5)
+    assert.equal(after.truncated, false)
+    ledger.close()
+  })
+
+  it('keeps match "all" inside the current project scope', async () => {
+    const { call, ledger } = setup()
+    await seedMemories(call, 2)
+    // A memory belonging to another project must never enter the preview.
+    ledger.beginOperation({
+      operationId: 'op-foreign', memoryId: 'foreign', verb: 'create',
+      scope: 'some-other-project', shelf: 'default',
+      hypatiaName: 'dshmem:v1:ffff:foreign', kind: 'rule',
+      title: 'Foreign rule', payload: { title: 'Foreign rule' }, payloadHash: 'h',
+    })
+    ledger.markDispatched('op-foreign')
+    ledger.commitReceipt('op-foreign', { verified: true })
+
+    const preview = await call('memory_forget_preview', { query: 'everything', match: 'all' })
+
+    assert.equal(preview.matched, 2)
+    assert.ok(!preview.candidates.some((entry) => entry.memory_id === 'foreign'))
+    ledger.close()
+  })
+})
+
 describe('status and reconcile', () => {
   it('reports capabilities and counts without leaking payloads', async () => {
     const { call, ledger } = setup()

@@ -348,6 +348,19 @@ export class Ledger {
   }
 
   /**
+   * Exact number of active records in this scope.
+   *
+   * Callers that page or cap their output need the true total to report what
+   * they left out, which a capped `recallCandidates` cannot tell them.
+   */
+  countRecallCandidates({ scope, shelf }) {
+    return this.db.prepare(`
+      SELECT COUNT(*) AS count FROM memory_record
+       WHERE state = ? AND scope = ? AND shelf = ?
+    `).get(RecordState.APPLIED, scope, shelf)?.count ?? 0
+  }
+
+  /**
    * Whether a Hypatia key may be surfaced by automatic recall in `scope`.
    * Requires an active ledger row whose scope matches exactly.
    */
