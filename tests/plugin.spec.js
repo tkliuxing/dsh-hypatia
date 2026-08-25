@@ -25,13 +25,24 @@ function hypatiaMissing() {
 
 const stateDirs = []
 
-/** A cordis-like context recording registrations and emitted events. */
+/**
+ * A cordis-like context recording registrations and emitted events.
+ *
+ * `agents.roots()` reports the agents this context has published, which is
+ * what the real service does. An earlier version of this fake returned a
+ * constant empty array, and because `apply()` skips any agent absent from
+ * `roots()`, every per-agent registration silently short-circuited: tools,
+ * compaction ingest, and disposal were never exercised through `apply()` at
+ * all. The suite stayed green while the wiring layer had zero coverage, which
+ * is how a broken `inject` declaration reached a real profile.
+ */
 function makeContext() {
   const handlers = new Map()
+  const roots = []
   const ctx = {
     warnings: [],
     skills: { registered: [], register(skill) { this.registered.push(skill) } },
-    agents: { roots: () => [] },
+    agents: { roots: () => [...roots] },
     handlers,
     logger: () => ({ warn: (message) => ctx.warnings.push(message) }),
     get: () => undefined,
@@ -41,9 +52,44 @@ function makeContext() {
       handlers.set(event, list)
       return () => handlers.set(event, (handlers.get(event) ?? []).filter((h) => h !== handler))
     },
+    emit(event, payload) {
+      for (const handler of [...(handlers.get(event) ?? [])]) handler(payload)
+    },
     has: (event) => (handlers.get(event) ?? []).length > 0,
+    /** Publish an agent the way the runtime does: root list first, then event. */
+    createAgent(agent) {
+      roots.push(agent)
+      ctx.emit('agent/created', { agent })
+      return agent
+    },
+    disposeAgent(agent) {
+      const index = roots.indexOf(agent)
+      if (index !== -1) roots.splice(index, 1)
+      ctx.emit('agent/disposed', { agent })
+    },
   }
   return ctx
+}
+
+/** An agent whose own context carries a tool registry, as the runtime's does. */
+function makeRootAgent({ id = 'agent-1', cwd = '/work/wiring', origin, withTools = true } = {}) {
+  const registered = new Map()
+  return {
+    session: { id, header: { id, cwd, origin, createdAt: 1 } },
+    ctx: {
+      registered,
+      ...(withTools
+        ? {
+          tools: {
+            register(definition) {
+              registered.set(definition.name, definition)
+              return () => registered.delete(definition.name)
+            },
+          },
+        }
+        : {}),
+    },
+  }
 }
 
 function freshStateDir() {
@@ -222,6 +268,108 @@ describe('same-request recall wiring', { skip: hypatiaMissing() }, () => {
 
     assert.equal(decision.kind, 'reject')
     assert.equal(decision.reason, 'downstream said no')
+  })
+})
+
+describe('per-agent wiring', { skip: hypatiaMissing() }, () => {
+  /** Boot the plugin against a throwaway ledger and return the live context. */
+  async function boot(overrides = {}) {
+    const ctx = makeContext()
+    await apply(ctx, { state: { dir: freshStateDir() }, recall: { hypatiaSupplement: false }, ...overrides })
+    return ctx
+  }
+
+  it('registers every memory tool on a published root agent', async () => {
+    const ctx = await boot()
+    const agent = ctx.createAgent(makeRootAgent())
+
+    assert.deepEqual([...agent.ctx.registered.keys()].sort(), [
+      'memory_forget_confirm',
+      'memory_forget_preview',
+      'memory_reconcile',
+      'memory_remember',
+      'memory_search',
+      'memory_status',
+    ])
+  })
+
+  it('wires tools that actually run against the booted ledger', async () => {
+    const ctx = await boot()
+    const agent = ctx.createAgent(makeRootAgent())
+
+    // Exercising the tool through the wiring is the point: a registration that
+    // hands over a broken ledger or scope would pass a name-only assertion.
+    const status = await agent.ctx.registered.get('memory_status').execute({}, {})
+
+    assert.equal(status.error, undefined)
+    assert.match(status.scope, /^wiring-/)
+    assert.ok(Array.isArray(status.capabilities))
+  })
+
+  it('scopes each agent to its own workspace', async () => {
+    const ctx = await boot()
+    const one = ctx.createAgent(makeRootAgent({ id: 'a', cwd: '/work/project-one' }))
+    const two = ctx.createAgent(makeRootAgent({ id: 'b', cwd: '/work/project-two' }))
+
+    const first = await one.ctx.registered.get('memory_status').execute({}, {})
+    const second = await two.ctx.registered.get('memory_status').execute({}, {})
+
+    assert.notEqual(first.scope, second.scope)
+  })
+
+  it('skips subagent sessions', async () => {
+    const ctx = await boot()
+    const agent = ctx.createAgent(makeRootAgent({ origin: 'subagent' }))
+
+    assert.equal(agent.ctx.registered.size, 0)
+  })
+
+  it('registers an agent only once', async () => {
+    const ctx = await boot()
+    const agent = makeRootAgent()
+    ctx.createAgent(agent)
+    ctx.emit('agent/created', { agent })
+
+    assert.equal(agent.ctx.registered.size, 6)
+  })
+
+  it('disposes an agent\'s tools when the agent goes away', async () => {
+    const ctx = await boot()
+    const agent = ctx.createAgent(makeRootAgent())
+    assert.equal(agent.ctx.registered.size, 6)
+
+    ctx.disposeAgent(agent)
+
+    assert.equal(agent.ctx.registered.size, 0, 'a disposed agent must not leave tools registered')
+  })
+
+  it('warns instead of silently skipping when the tools service is absent', async () => {
+    const ctx = await boot()
+    const agent = ctx.createAgent(makeRootAgent({ withTools: false }))
+
+    assert.equal(agent.ctx.registered.size, 0)
+    assert.match(ctx.warnings.join('\n'), /`tools` service is unavailable/)
+  })
+
+  it('registers no tools when registerTools is off, and does not warn', async () => {
+    const ctx = await boot({ registerTools: false })
+    const agent = ctx.createAgent(makeRootAgent())
+
+    assert.equal(agent.ctx.registered.size, 0)
+    assert.ok(!ctx.warnings.join('\n').includes('`tools` service is unavailable'))
+  })
+
+  it('subscribes compaction ingest for the agent', async () => {
+    const before = makeContext()
+    await apply(before, { state: { dir: freshStateDir() }, ingest: { compaction: false } })
+    const withoutIngest = (before.handlers.get('session/event') ?? []).length
+
+    const ctx = await boot()
+    ctx.createAgent(makeRootAgent())
+    const withIngest = (ctx.handlers.get('session/event') ?? []).length
+
+    assert.equal(withoutIngest, 0)
+    assert.equal(withIngest, 1, 'compaction ingest must attach through apply(), not only in unit tests')
   })
 })
 
