@@ -13,6 +13,7 @@ import { openLedger } from '../src/ledger/ledger.js'
 import { MutationCoordinator } from '../src/mutations.js'
 import { createMemoryPolicy } from '../src/policy.js'
 import { registerCompactionIngest, stripDerivedContext } from '../src/ingest/compaction.js'
+import { sourceIdentityOf } from '../src/identity.js'
 import { RECALL_BLOCK_START, RecallService } from '../src/recall.js'
 import { normalizeConfig } from '../src/config.js'
 import { FakeAdapter, FakeContext } from './helpers/fake-adapter.js'
@@ -38,6 +39,11 @@ function summaryEvent({ start, end, text, seq = 100, compactionId = 'c1' }) {
       model: 'test-model',
     },
   }
+}
+
+/** Let the serialized ingest queue settle. */
+async function drain(ticks = 8) {
+  for (let i = 0; i < ticks; i += 1) await new Promise((resolve) => setImmediate(resolve))
 }
 
 function setup({ preset = 'standard', agentOptions } = {}) {
@@ -143,6 +149,152 @@ describe('compaction ingestion', () => {
     assert.equal(provenance.from_seq, 5)
     assert.equal(provenance.through_seq, 30)
     assert.equal(provenance.session_id, 'session-1')
+    ledger.close()
+  })
+})
+
+describe('startup catch-up', () => {
+  /** Put summaries in the log *before* the plugin registers. */
+  function withLoggedSummaries(events, options) {
+    const agent = makeAgent(options)
+    agent.session.events = events
+    return agent
+  }
+
+  it('ingests summaries already in the log when the plugin loads', async () => {
+    const ledger = openLedger(':memory:')
+    const adapter = new FakeAdapter()
+    const warn = () => {}
+    const mutations = new MutationCoordinator({ ledger, adapter, shelf: 'default', warn })
+    const ctx = new FakeContext()
+    const agent = withLoggedSummaries([
+      summaryEvent({ start: 1, end: 20, text: 'Earlier decision.', seq: 21 }),
+      summaryEvent({ start: 21, end: 40, text: 'Later decision.', seq: 41, compactionId: 'c2' }),
+    ])
+
+    registerCompactionIngest({
+      ctx, agent, ledger, mutations,
+      policy: createMemoryPolicy({ preset: 'standard' }),
+      scope: SCOPE, shelf: 'default', warn,
+    })
+    await drain()
+
+    assert.equal(adapter.knowledge.size, 2, 'a reload must not silently skip logged summaries')
+    ledger.close()
+  })
+
+  it('skips ranges the cursor already accounts for', async () => {
+    const ledger = openLedger(':memory:')
+    const adapter = new FakeAdapter()
+    const warn = () => {}
+    const mutations = new MutationCoordinator({ ledger, adapter, shelf: 'default', warn })
+    const ctx = new FakeContext()
+    const agent = withLoggedSummaries([
+      summaryEvent({ start: 1, end: 20, text: 'Already ingested.', seq: 21 }),
+      summaryEvent({ start: 21, end: 40, text: 'Still pending.', seq: 41, compactionId: 'c2' }),
+    ])
+    const sourceIdentity = sourceIdentityOf({
+      sessionId: 'session-1', sessionCreatedAt: 1, persistenceSource: 'dsh-session',
+    })
+    ledger.setCursor({ sourceIdentity, sessionId: 'session-1', lastAppliedSeq: 20 })
+
+    registerCompactionIngest({
+      ctx, agent, ledger, mutations,
+      policy: createMemoryPolicy({ preset: 'standard' }),
+      scope: SCOPE, shelf: 'default', warn,
+    })
+    await drain()
+
+    assert.equal(adapter.knowledge.size, 1)
+    assert.equal(adapter.calls.filter((call) => call[0] === 'knowledgeCreate').length, 1,
+      'a settled range must cost no CLI call')
+    ledger.close()
+  })
+
+  it('does not duplicate when catch-up races live delivery', async () => {
+    const ledger = openLedger(':memory:')
+    const adapter = new FakeAdapter()
+    const warn = () => {}
+    const mutations = new MutationCoordinator({ ledger, adapter, shelf: 'default', warn })
+    const ctx = new FakeContext()
+    const event = summaryEvent({ start: 1, end: 20, text: 'Same range.', seq: 21 })
+    const agent = withLoggedSummaries([event])
+
+    registerCompactionIngest({
+      ctx, agent, ledger, mutations,
+      policy: createMemoryPolicy({ preset: 'standard' }),
+      scope: SCOPE, shelf: 'default', warn,
+    })
+    // The same event also arrives through the live seam.
+    ctx.emit('session/event', agent.session, event)
+    await drain()
+
+    assert.equal(adapter.knowledge.size, 1)
+    assert.equal(ledger.db.prepare('SELECT COUNT(*) AS c FROM memory_record').get().c, 1)
+    ledger.close()
+  })
+
+  it('respects the fork seed boundary during catch-up', async () => {
+    const ledger = openLedger(':memory:')
+    const adapter = new FakeAdapter()
+    const warn = () => {}
+    const mutations = new MutationCoordinator({ ledger, adapter, shelf: 'default', warn })
+    const ctx = new FakeContext()
+    const agent = withLoggedSummaries([
+      summaryEvent({ start: 1, end: 20, text: 'Parent history.', seq: 10 }),
+      summaryEvent({ start: 51, end: 70, text: 'Child work.', seq: 60, compactionId: 'c2' }),
+    ], { seedLength: 50 })
+
+    registerCompactionIngest({
+      ctx, agent, ledger, mutations,
+      policy: createMemoryPolicy({ preset: 'standard' }),
+      scope: SCOPE, shelf: 'default', warn,
+    })
+    await drain()
+
+    assert.equal(adapter.knowledge.size, 1, 'seeded parent history belongs to the parent source')
+    ledger.close()
+  })
+
+  it('stops catching up once disposed', async () => {
+    const ledger = openLedger(':memory:')
+    const adapter = new FakeAdapter()
+    const warn = () => {}
+    const mutations = new MutationCoordinator({ ledger, adapter, shelf: 'default', warn })
+    const ctx = new FakeContext()
+    const agent = withLoggedSummaries(
+      Array.from({ length: 5 }, (_unused, index) => summaryEvent({
+        start: index * 10 + 1, end: index * 10 + 10, text: `Chunk ${index}.`,
+        seq: index * 10 + 11, compactionId: `c${index}`,
+      })),
+    )
+
+    const dispose = registerCompactionIngest({
+      ctx, agent, ledger, mutations,
+      policy: createMemoryPolicy({ preset: 'standard' }),
+      scope: SCOPE, shelf: 'default', warn,
+    })
+    dispose()
+    await drain()
+
+    assert.equal(adapter.knowledge.size, 0, 'disposal must halt queued catch-up work')
+    ledger.close()
+  })
+
+  it('tolerates a session with no events', async () => {
+    const ledger = openLedger(':memory:')
+    const adapter = new FakeAdapter()
+    const ctx = new FakeContext()
+    const agent = makeAgent()
+
+    assert.doesNotThrow(() => registerCompactionIngest({
+      ctx, agent, ledger,
+      mutations: new MutationCoordinator({ ledger, adapter, shelf: 'default', warn: () => {} }),
+      policy: createMemoryPolicy({ preset: 'standard' }),
+      scope: SCOPE, shelf: 'default', warn: () => {},
+    }))
+    await drain()
+    assert.equal(adapter.knowledge.size, 0)
     ledger.close()
   })
 })

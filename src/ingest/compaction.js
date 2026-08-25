@@ -115,26 +115,89 @@ export function registerCompactionIngest({ ctx, agent, ledger, mutations, policy
 
   /** Serializes ingestion so two summaries cannot interleave their writes. */
   let queue = Promise.resolve()
+  let disposed = false
+
+  const enqueue = (event, range) => {
+    queue = queue
+      .then(() => (disposed ? undefined : ingestOne({
+        event, range, sourceIdentity, seedLength, header,
+        ledger, mutations, scope, shelf, warn,
+      })))
+      .catch((error) => warn(`compaction ingest failed: ${error.message}`))
+  }
 
   const dispose = ctx.on('session/event', (session, event) => {
     if (session !== agent.session) return
-    if (event?.type !== 'compaction/summary') return
-    if (typeof event.seq === 'number' && event.seq < seedLength) return
-
-    const range = event.data?.shadowedRange
-    if (!range || typeof range.start !== 'number' || typeof range.end !== 'number') return
-
-    queue = queue
-      .then(() => ingestOne({
-        event, range, sourceIdentity, seedLength, header,
-        ledger, mutations, scope, shelf, warn,
-      }))
-      .catch((error) => warn(`compaction ingest failed: ${error.message}`))
+    const range = ingestableRange(event, seedLength)
+    if (!range) return
+    enqueue(event, range)
   })
 
+  // Catch up on summaries this plugin was not running to observe: a resumed
+  // session, a plugin reload, or the plugin being enabled partway through a
+  // project. Without this, `session/event` only ever delivers *future*
+  // compactions and everything already in the log is silently never ingested.
+  //
+  // Not awaited - registration must not block on subprocesses - and safe to
+  // race with live delivery, because the operation ID makes a double ingest a
+  // no-op rather than a duplicate.
+  catchUp({ agent, ledger, sourceIdentity, seedLength, enqueue, warn })
+
   return () => {
+    disposed = true
     dispose()
   }
+}
+
+/**
+ * The shadowed range this event should be ingested for, or null when it is not
+ * an ingestable compaction summary.
+ *
+ * `seq` is the event's own position in the session log; `shadowedRange` is the
+ * span of events it replaced. They are different number spaces, so the fork
+ * boundary is checked against `seq` and ingestion progress against the range.
+ */
+function ingestableRange(event, seedLength) {
+  if (event?.type !== 'compaction/summary') return null
+  if (typeof event.seq === 'number' && event.seq < seedLength) return null
+  const range = event.data?.shadowedRange
+  if (!range || typeof range.start !== 'number' || typeof range.end !== 'number') return null
+  return range
+}
+
+/**
+ * Queue every already-logged summary the cursor has not accounted for.
+ *
+ * The cursor stores the highest `shadowedRange.end` that reached `applied`.
+ * Compacted ranges advance monotonically, so anything at or below it is
+ * settled and can be skipped without a per-range database lookup.
+ */
+function catchUp({ agent, ledger, sourceIdentity, seedLength, enqueue, warn }) {
+  let events
+  try {
+    events = agent.session?.events
+  } catch (error) {
+    warn(`compaction catch-up could not read session events: ${error.message}`)
+    return
+  }
+  if (!Array.isArray(events) || events.length === 0) return
+
+  let lastAppliedSeq = 0
+  try {
+    lastAppliedSeq = ledger.getCursor(sourceIdentity)?.last_applied_seq ?? 0
+  } catch (error) {
+    // A cursor read failure only costs efficiency: ingestion stays idempotent.
+    warn(`compaction catch-up could not read its cursor: ${error.message}`)
+  }
+
+  let queued = 0
+  for (const event of events) {
+    const range = ingestableRange(event, seedLength)
+    if (!range || range.end <= lastAppliedSeq) continue
+    enqueue(event, range)
+    queued += 1
+  }
+  if (queued > 0) warn(`compaction catch-up queued ${queued} summaries logged before this load`)
 }
 
 /** Write one compaction summary as a plugin-owned memory, exactly once. */
