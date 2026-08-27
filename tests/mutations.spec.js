@@ -500,3 +500,73 @@ describe('reconciliation reports its own limits', () => {
   })
 })
 
+/**
+ * The coordinator records a retry durably but owns no timer: whoever wires it
+ * decides when to drain, and cordis owns that lifecycle.
+ */
+describe('retry notification', () => {
+  it('reports the backoff so a driver can schedule the drain', async () => {
+    const ledger = openLedger(':memory:')
+    const adapter = new FakeAdapter()
+    adapter.knowledgeCreate = async () => ({ ok: true, text: 'Created knowledge: x' })
+    const delays = []
+    const mutations = new MutationCoordinator({
+      ledger,
+      adapter,
+      shelf: 'default',
+      warn: () => {},
+      onRetryScheduled: (delayMs) => delays.push(delayMs),
+    })
+
+    await mutations.writeMemory(request())
+
+    assert.equal(ledger.status().retryQueue, 1)
+    assert.deepEqual(delays, [1_000], 'the driver needs the same backoff the ledger recorded')
+    ledger.close()
+  })
+
+  it('does not notify when the failure was not retryable', async () => {
+    const ledger = openLedger(':memory:')
+    const adapter = new FakeAdapter()
+    adapter.knowledgeGet = async () => ({
+      key: 'dshmem:v1:aaaa:mem-1', value: canonicalJson({ title: 'someone else', summary: 'foreign' }),
+    })
+    const delays = []
+    const mutations = new MutationCoordinator({
+      ledger,
+      adapter,
+      shelf: 'default',
+      warn: () => {},
+      onRetryScheduled: (delayMs) => delays.push(delayMs),
+    })
+
+    const result = await mutations.writeMemory(request())
+
+    assert.equal(result.status, 'conflict')
+    assert.deepEqual(delays, [], 'a conflict must never be retried, so nothing may be armed')
+    ledger.close()
+  })
+
+  it('keeps the write intact when the driver itself throws', async () => {
+    // The retry is already durable in the ledger by then; a driver that cannot
+    // arm must not turn a recorded retry into a thrown write.
+    const ledger = openLedger(':memory:')
+    const adapter = new FakeAdapter()
+    adapter.knowledgeCreate = async () => ({ ok: true, text: 'Created knowledge: x' })
+    const warnings = []
+    const mutations = new MutationCoordinator({
+      ledger,
+      adapter,
+      shelf: 'default',
+      warn: (message) => warnings.push(message),
+      onRetryScheduled: () => { throw new Error('timer service is gone') },
+    })
+
+    const result = await mutations.writeMemory(request())
+
+    assert.equal(result.status, 'uncertain')
+    assert.equal(ledger.status().retryQueue, 1, 'the retry must survive a broken driver')
+    assert.match(warnings.join('\n'), /retry driver could not be armed/)
+    ledger.close()
+  })
+})

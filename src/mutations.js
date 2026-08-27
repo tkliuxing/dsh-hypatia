@@ -30,14 +30,19 @@ export class MutationCoordinator {
   /**
    * @param {{ledger: import('./ledger/ledger.js').Ledger,
    *   adapter: import('./adapter/cli.js').HypatiaAdapter,
-   *   shelf: string, warn: (msg: string) => void, batchSize?: number}} deps
+   *   shelf: string, warn: (msg: string) => void, batchSize?: number,
+   *   onRetryScheduled?: (delayMs: number) => void}} deps
    */
-  constructor({ ledger, adapter, shelf, warn, batchSize = 50 }) {
+  constructor({ ledger, adapter, shelf, warn, batchSize = 50, onRetryScheduled = null }) {
     this.ledger = ledger
     this.adapter = adapter
     this.shelf = shelf
     this.warn = warn
     this.batchSize = batchSize
+    // Notified when a retry becomes due later. The coordinator does not own a
+    // timer itself: cordis owns teardown through `ctx.effect`, and a timer
+    // created here would outlive an unloaded plugin.
+    this.onRetryScheduled = onRetryScheduled
   }
 
   /**
@@ -230,6 +235,13 @@ export class MutationCoordinator {
         this.ledger.deadLetter(operationId, memoryId, error.toJSON())
       } else {
         this.ledger.scheduleRetry(operationId, { delayMs, error: error.toJSON() })
+        try {
+          this.onRetryScheduled?.(delayMs)
+        } catch (hookError) {
+          // The retry is already durable in the ledger; a driver that cannot
+          // arm must not turn a recorded retry into a thrown write.
+          this.warn(`retry driver could not be armed: ${hookError.message}`)
+        }
       }
     }
     return {

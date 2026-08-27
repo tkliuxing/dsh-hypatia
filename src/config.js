@@ -133,6 +133,16 @@ export function normalizeConfig(raw = {}) {
        * settled.
        */
       batchSize: num(reconcile.batchSize, 50, { min: 1, max: 1_000 }),
+      /**
+       * Drain the retry queue inside the session that scheduled it.
+       *
+       * Without this, a retry scheduled by a transient failure - another
+       * process holding the DuckDB lock is the realistic one - waits for the
+       * next plugin load or an explicit `memory_reconcile`, so a write the user
+       * asked for stays unverified for the rest of the session. Still gated by
+       * `Capability.RECONCILE`, like every other path into `reconcile()`.
+       */
+      retryDriver: bool(reconcile.retryDriver, true),
     }),
 
     /**

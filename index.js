@@ -15,6 +15,7 @@
  *   src/adapter/         the one place a subprocess is spawned
  *   src/mutations.js     intent -> CLI -> read-back verification -> receipt
  *   src/recall.js        same-request recall inside `agent/pre-step`
+ *   src/retry-driver.js  the in-session drain for the retry queue
  *   src/tools.js         the narrow `memory_*` tools, replacing model Bash
  *   src/ingest/          idempotent ingestion of DSH compaction summaries
  *
@@ -36,6 +37,7 @@ import { openLedger } from './src/ledger/ledger.js'
 import { MutationCoordinator } from './src/mutations.js'
 import { Capability, createMemoryPolicy } from './src/policy.js'
 import { RecallService } from './src/recall.js'
+import { createRetryDriver } from './src/retry-driver.js'
 import { registerSkills } from './src/skills.js'
 import { registerMemoryTools } from './src/tools.js'
 
@@ -161,8 +163,22 @@ export async function apply(ctx, rawConfig = {}) {
 
   const shelf = config.adapter.shelf
 
+  // Drains the retry queue inside the session that scheduled it; the timer's
+  // lifecycle is tied to the `ctx.effect` teardown below.
+  const retryDriver = createRetryDriver({
+    enabled: config.reconcile.retryDriver,
+    canReconcile: () => policy.can(Capability.RECONCILE),
+    reconcile: () => mutations.reconcile(),
+    warn,
+  })
+
   const mutations = new MutationCoordinator({
-    ledger, adapter, shelf, warn, batchSize: config.reconcile.batchSize,
+    ledger,
+    adapter,
+    shelf,
+    warn,
+    batchSize: config.reconcile.batchSize,
+    onRetryScheduled: (delayMs) => retryDriver.arm(delayMs),
   })
   const recall = new RecallService({ ledger, adapter, policy, config, warn })
 
@@ -303,6 +319,7 @@ export async function apply(ctx, rawConfig = {}) {
     return () => {
       stopCreated()
       stopDisposed()
+      retryDriver.stop()
       for (const dispose of installed.values()) dispose()
       installed.clear()
       try {
