@@ -24,8 +24,10 @@ Phase 4 remains unauthorized.
 | 4 — in-repository helper | not authorized | — |
 | Full-transcript vector mirror | NO-GO, unimplemented | `transcript-mirror` capability is refused and warns |
 
-The compatibility bridge survives behind `legacyBridge.enabled`, defaulting to off,
-in `src/legacy-bridge.js`.
+The compatibility bridge is **removed**. `src/legacy-bridge.js`, its tests, and the
+deprecated appendix in `skills/hypatia-memory/SKILL.md` are deleted; a profile that
+still carries `legacyBridge.enabled` is told at load that the flag no longer does
+anything, rather than booting silently without it.
 
 ### Measured facts added since the research revision
 
@@ -41,11 +43,24 @@ Two upstream behaviours were measured during Phase 1 and changed the design:
   fail with exit 1. Classification is therefore text-driven, with exit status as
   corroboration only.
 
-Recall latency against the 200 ms deadline (hypatia 0.1.4, Node 22.22, darwin/arm64):
-P95 45 ms at 100 records and 50 ms at 500 records single-session; 176 ms and 185 ms
-respectively at four concurrent sessions. Serialized concurrency, not dataset size,
-is the cost driver. The one-shot CLI meets the target at the supported size, so the
-Phase 4 trigger has **not** fired.
+Recall latency against the 200 ms deadline, re-measured after the schema v2 and
+recall changes (hypatia 0.1.4, Node 22.22.3, darwin/arm64):
+
+| records | sessions | full recall P50 | full recall P95 | max | failures |
+|---|---|---|---|---|---|
+| 100 | 1 | 47.8 ms | 52.2 ms | 58.2 ms | 0 |
+| 100 | 4 | 97.8 ms | 189.2 ms | 190.0 ms | 0 |
+| 1,000 | 1 | 50.3 ms | 54.9 ms | 61.8 ms | 0 |
+| 1,000 | 4 | 100.4 ms | 198.9 ms | 199.1 ms | 0 |
+
+Serialized concurrency, not dataset size, is the cost driver: a tenfold increase in
+records costs about 3 ms, while four concurrent sessions roughly quadruple the P95.
+The one-shot CLI still meets the target at the supported size, so the Phase 4 trigger
+has **not** fired - but four concurrent sessions at 1,000 records now sit within
+1 ms of the deadline, and the individual `jse query` and `fts search` operations
+already exceed it (P95 203.4 ms, max 207.6 ms). Recall fails open, so this costs
+coverage rather than turns. Treat four concurrent sessions as the measured ceiling
+and re-measure before raising `adapter.maxConcurrentReads` or the record count.
 
 ## Goal
 
@@ -673,15 +688,17 @@ Prerequisites:
 
 Until every prerequisite is met, store only semantic memories, summaries, confirmed rules/taboos, relationships, and provenance.
 
-## Current Compatibility Bridge
+## Removed Compatibility Bridge
 
-The existing lifecycle fixes remain valid:
+The `TRIGGER + skill + Bash` bridge has been deleted. Its lifecycle fixes remain
+valid for the host path that replaced it:
 
 - Detect direct user prompts from `agent/pre-step.messages`, not from pre-populated session events.
 - Do not consume deferred startup on a context-only step.
 - Fail closed when sandbox policy resolution throws.
 
-However, the current `TRIGGER + skill + Bash` bridge remains a temporary compatibility mode because it still has these architectural faults:
+It was removed rather than kept indefinitely because every one of these faults was
+structural, not a bug to be fixed:
 
 - Memory protocol text is inserted into the durable model-visible transcript.
 - Assistant logging is queued to the next step and can lose the final response.
@@ -692,13 +709,14 @@ However, the current `TRIGGER + skill + Bash` bridge remains a temporary compati
 - Raw transcript duplication increases privacy and retention obligations.
 - `danger-full-access` is incorrectly overloaded as memory authorization.
 
-Migration rule:
+Cutover is complete:
 
-- Keep the bridge behind an explicit legacy feature flag while the host CLI adapter is incomplete.
-- Do not add new features to the trigger protocol.
-- At cutover, remove automatic `TRIGGER:log`, `TRIGGER:extract`, and `TRIGGER:immediate` messages.
-- Replace `hypatia-memory` Bash instructions with narrow tool behavior.
-- Keep generic Hypatia CLI administration separate, explicit, and permissioned.
+- Automatic `TRIGGER:log`, `TRIGGER:extract`, and `TRIGGER:immediate` messages are gone.
+- `hypatia-memory` documents the tools only; the Bash instructions are deleted.
+- Generic Hypatia CLI administration stays separate, explicit, and permissioned in the
+  `hypatia` skill, which still requires `danger-full-access`.
+- `legacyBridge.enabled` is still read, for one reason: a profile that sets it gets a
+  warning naming its removal instead of silently losing a memory path.
 
 ## Implementation Order
 
@@ -711,8 +729,8 @@ Recommended pull-request sequence, all in this repository:
 5. **Explicit tools:** remember, search, forget preview/confirm, status, and reconcile.
 6. **Compaction ingestion:** durable cursor and idempotent summary operations.
 7. **Auxiliary extraction:** proposal schema, validator, retry/dead-letter, and red-team tests.
-8. **Legacy removal:** delete `src/legacy-bridge.js` and its skill appendix once deployments have migrated off `legacyBridge.enabled`.
-9. **Performance decision:** measured; the CLI meets the target at the supported size. Re-measure before raising concurrency.
+8. **Legacy removal:** DONE. `src/legacy-bridge.js`, its tests, and the skill appendix are deleted; the flag survives only as a removal notice.
+9. **Performance decision:** measured twice; the CLI meets the target at the supported size. Four concurrent sessions at 1,000 records is the measured ceiling - re-measure before raising concurrency.
 
 ## Definition of Done
 

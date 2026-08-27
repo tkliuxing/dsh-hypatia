@@ -40,9 +40,9 @@ Requires **Node 22.5+** for `node:sqlite`. The benchmark creates and removes its
 | `src/adapter/` | the only place a subprocess is spawned |
 | `src/mutations.js` | intent → CLI → read-back verification → receipt |
 | `src/recall.js` | same-request recall in `agent/pre-step` |
+| `src/retry-driver.js` | the in-session drain for the retry queue |
 | `src/tools.js` | the narrow `memory_*` tools |
 | `src/ingest/compaction.js` | idempotent ingestion of DSH `compaction/summary` events |
-| `src/legacy-bridge.js` | the deprecated TRIGGER protocol, off by default |
 
 ### Invariants you must not break
 
@@ -58,7 +58,9 @@ These are each covered by tests, so violating one fails the suite — but the *r
 - **Recall fails open.** Any timeout, cancellation, adapter fault, or parse failure yields zero entries and the turn proceeds. It also runs after `await next()` and only appends to an accepted decision.
 - **Forget tombstones before touching Hypatia.** After `ledger.tombstone()` returns, recall already excludes the record even if the process dies. Cleanup status is reported exactly (`cleanup-uncertain` is a real outcome, not a failure to hide).
 - **`memory_forget_confirm` accepts only IDs from its preview token.** That gate is the reason a prompt injection cannot broaden a delete.
-- **A capped list must announce its cap.** `memory_forget_preview` returns `matched`, `listed`, `total_in_scope`, and `truncated`. A user confirming a silently truncated list believes the project is clean while entries remain. "Forget everything" is `match: 'all'`, because the words a user says for it appear in none of the stored memories and a term search would return an empty list that reads as "nothing to delete".
+- **A capped list must announce its cap, and the cap must be configurable.** The same rule in four places; three of them were silent once. `memory_forget_preview` returns `matched`, `listed`, `total_in_scope`, and `truncated` — a user confirming a silently truncated list believes the project is clean while entries remain. Automatic recall scores a newest-first pool of `recall.candidatePool` records and returns `coverage: {considered, totalInScope, truncated}`, which `index.js` reports once per scope per process rather than per turn. `memory_search` scans `recall.searchScanLimit` records and says so in its `note`. `memory_reconcile` settles `reconcile.batchSize` operations and cleanups. An unannounced cap makes "nothing found" indistinguishable from "never looked": for recall that silently costs coverage as a project grows, for a delete preview it costs data. Relatedly, "forget everything" is `match: 'all'`, because the words a user says for it appear in none of the stored memories and a term search would return an empty list that reads as "nothing to delete".
+- **`truncated` and `remaining` are different questions.** `reconcile()` reports `truncated` when a batch filled — "run again" — and `remaining` as the honest outstanding count. They diverge: an operation whose record is missing or tombstoned can never be settled, so it is counted in `remaining` forever. Advising another pass on `remaining` alone loops the model against work that never shrinks, which is the same dead end `memory_status` avoids by never naming a tool the policy withholds.
+- **The retry drain is armed, never polled.** `#recordFailure` records a retry durably and calls `onRetryScheduled(delayMs)`; `src/retry-driver.js` owns one unref'd timer, fires `RETRY_DRAIN_SLACK_MS` after the backoff so `dueRetries` really sees the row, and drains through the same `reconcile()` as every other path — inheriting its conflict handling and tombstone checks. It re-checks `Capability.RECONCILE` at arming time (one operation, one capability) and is stopped from the `ctx.effect` teardown, because a timer that outlives an unloaded plugin reconciles against a closed ledger. The coordinator owns no timer of its own: cordis owns that lifecycle.
 - **One operation, one capability.** The startup reconciliation pass and `memory_reconcile` both check `Capability.RECONCILE`. When they disagreed, a default deployment could dispatch writes it had no way to settle, while `memory_status` advised a tool that always refused. `memory_status` also never names a tool the current policy withholds.
 - **Registration reads the cursor, not just writes it.** `registerCompactionIngest` scans `session.events` for summaries above `session_cursor.last_applied_seq`, because `session/event` only ever delivers *future* compactions — a resume, reload, or mid-project enable would otherwise skip everything already logged. The cursor is a fast-path skip; `ingestOne`'s exact range-key check is the correctness boundary.
 - **A `presentCall` view is `card`-tagged, and the tag is the wire contract.** `ToolCallView` is a union discriminated by `card` (`'generic' | 'terminal' | 'diff'`), not by a `tag` field, and the salient input field is `rawInput`. The host recomputes every view at read time and validates the page with `z.looseObject({ card: z.string() })`, so one malformed view fails the *whole* transcript: an existing session stops opening with `{"expected":"string","code":"invalid_type","path":["events",N,"view","view","card"]}`. Nothing is persisted, so correcting the presenter repairs every past session at once. `defineTool` is unavailable here (see below) and nothing else type-checks these objects, which is why `tests/tools.spec.js` mirrors the contract and asserts it for every tool.
@@ -91,7 +93,7 @@ Prefer a mutation check for anything load-bearing: break the code deliberately a
 - **Only this repository may change.** DSH and Hypatia are unmodified external dependencies — do not patch, vendor, or require new lifecycle hooks from either.
 - Phases 0–2 are delivered. **Phase 3 (background model-assisted extraction) is NO-GO**; `extraction.enabled` is forced off in `config.js` and warns. **Full-transcript mirroring is NO-GO**; the `transcript-mirror` capability is refused in `policy.js`.
 - **Phase 4 (an in-repository Rust helper, native dependency, or bundled executable) requires explicit user approval first.** The Phase 1 benchmark met its target, so its trigger has not fired.
-- The legacy TRIGGER bridge takes **no new features**. It exists only so an in-flight deployment can migrate.
+- The legacy TRIGGER bridge is **removed** (Implementation Order step 8). `legacyBridge.enabled` survives in `config.js` only as `requested`, so a profile still setting it gets a removal notice at load instead of silently losing a memory path. Do not reintroduce it.
 
 ## skills/
 
@@ -100,6 +102,6 @@ Prefer a mutation check for anything load-bearing: break the code deliberately a
 The frontmatter parser (`src/skills.js`) is deliberately minimal — scalars, double-quoted strings, booleans — so don't add YAML features it can't parse.
 
 - `hypatia` is now the **explicit administrative** path (shelves, archives, models, unscoped search) and still requires `danger-full-access`.
-- `hypatia-memory` documents the tool-based path; the original TRIGGER protocol survives verbatim in a deprecated appendix for `legacyBridge.enabled` deployments.
+- `hypatia-memory` documents the tool-based path only. The deprecated TRIGGER appendix was deleted with the bridge; do not restore it.
 
 One trap the skills still warn about: **never express "global scope" as `["$contains", "scopes", ""]`** — the empty string is a substring of every scope, so it matches all projects. This is also why `src/identity.js` exports `GLOBAL_SCOPE` but recall never matches on it; exact scope comes from the ledger.

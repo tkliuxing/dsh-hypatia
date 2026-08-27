@@ -113,13 +113,20 @@ dsh-hypatia 宿主插件
           deadlineMs: 200
           maxResults: 5
           maxBytes: 10240
+          candidatePool: 50     # 每轮参与打分的账本记录数
+          searchScanLimit: 200  # memory_search 扫描的账本记录数
           hypatiaSupplement: true
           vectorSupplement: false
         ingest:
           compaction: true
-        legacyBridge:
-          enabled: false        # 已废弃的 TRIGGER/Bash 协议
+        reconcile:
+          batchSize: 50         # 每次调和处理的操作与清理条数
+          retryDriver: true     # 在本会话内排空重试队列
 ```
+
+### 覆盖上限
+
+自动召回与 `memory_search` 都只对账本中**按时间倒序**的一段做打分，因此当项目记忆条数超过上限时，更旧的条目只能靠 Hypatia 全文检索补充回来。这两个上限都不是静默的：召回会在日志中按 scope 报告一次，`memory_search` 会在 `note` 中说明，`memory_status` 则返回 `recall_coverage`。想扩大范围就调高 `recall.candidatePool` —— 代价只是每轮一次更宽的 SQLite 读取，不会多起子进程。
 
 ### 记忆授权
 
@@ -167,11 +174,11 @@ npm run bench -- --sizes 100,1000           # 性能门禁
 
 `skills/` 由本仓库自行维护 —— 它曾从 hypatia 仓库同步而来，现已解耦。直接编辑 `skills/*/SKILL.md`。
 
-## 从 TRIGGER 桥接迁移
+## TRIGGER 桥接已移除
 
-早期版本会注入 `[hypatia-memory] TRIGGER:*` 消息，并要求模型通过 Bash 运行 `hypatia`。该模式已废弃并默认关闭。它会把协议文本写进持久转录，没有持久 operation ID 与写入回执，可能丢失最后一条助手回复，并且把 `danger-full-access` 误当作记忆授权。
+早期版本会注入 `[hypatia-memory] TRIGGER:*` 消息，并要求模型通过 Bash 运行 `hypatia`。该模式已**移除**：它会把协议文本写进持久转录，没有持久 operation ID 与写入回执，可能丢失最后一条助手回复，并且把 `danger-full-access` 误当作记忆授权。
 
-只有在迁移期需要让线上部署继续工作时，才设置 `legacyBridge.enabled: true`。它不再新增功能；在你验证新工具期间，它可以与宿主路径并存。
+仍然设置了 `legacyBridge.enabled: true` 的 profile 可以正常加载，只会收到一条说明其已被移除的警告 —— 该配置项不再有任何作用，可以直接删掉。它过去做的事现在全部由 `memory_*` 工具加自动召回承担，两者都不需要 Bash，也不需要 full-access 会话。
 
 ## 许可证
 

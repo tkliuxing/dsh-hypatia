@@ -113,13 +113,25 @@ Everything is optional; override on the cordis row:
           deadlineMs: 200
           maxResults: 5
           maxBytes: 10240
+          candidatePool: 50     # ledger records scored per turn
+          searchScanLimit: 200  # ledger records memory_search scans
           hypatiaSupplement: true
           vectorSupplement: false
         ingest:
           compaction: true
-        legacyBridge:
-          enabled: false        # deprecated TRIGGER/Bash protocol
+        reconcile:
+          batchSize: 50         # operations and cleanups settled per pass
+          retryDriver: true     # drain the retry queue in-session
 ```
+
+### Coverage caps
+
+Recall and `memory_search` both score a **newest-first** slice of the ledger, so a
+project with more memories than the cap reaches the model only through the Hypatia
+full-text supplement. Neither cap is silent: recall reports its ceiling once per
+scope in the log, `memory_search` names it in the tool's `note`, and `memory_status`
+returns `recall_coverage`. Raise `recall.candidatePool` to widen the pool — it costs
+one wider SQLite read per turn and no subprocess.
 
 ### Memory authorization
 
@@ -167,11 +179,11 @@ npm run bench -- --sizes 100,1000           # performance gate
 
 `skills/` is self-maintained here — it was once synced from the hypatia repo, but the two are now decoupled. Edit `skills/*/SKILL.md` directly.
 
-## Migrating from the TRIGGER bridge
+## The TRIGGER bridge is gone
 
-Earlier versions injected `[hypatia-memory] TRIGGER:*` messages and asked the model to run `hypatia` through Bash. That mode is deprecated and off by default. It writes protocol text into the durable transcript, has no durable operation IDs or write receipts, can lose the final assistant reply, and overloads `danger-full-access` as memory consent.
+Earlier versions injected `[hypatia-memory] TRIGGER:*` messages and asked the model to run `hypatia` through Bash. That mode has been **removed**: it wrote protocol text into the durable transcript, had no durable operation IDs or write receipts, could lose the final assistant reply, and overloaded `danger-full-access` as memory consent.
 
-Set `legacyBridge.enabled: true` only to keep an in-flight deployment working during migration. It takes no new features, and it is safe to run alongside the host path while you verify the tools.
+A profile that still sets `legacyBridge.enabled: true` loads normally and logs a warning naming the removal — the key does nothing and can be deleted. Everything it used to do is now the `memory_*` tools plus automatic recall, neither of which needs Bash or a full-access session.
 
 ## License
 
