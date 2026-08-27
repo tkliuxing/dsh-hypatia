@@ -447,3 +447,82 @@ describe('memory_remember regressions', () => {
     ledger.close()
   })
 })
+
+/**
+ * The host renders a tool call - live and on every replay of an old session -
+ * by calling `presentCall` and shipping what it returns inside the transcript
+ * page. That page is validated against the harness wire schema, whose only
+ * requirement on the interior is a string `card` discriminant. A view without
+ * one fails the WHOLE page: an existing session stops opening at the first
+ * memory tool call it contains.
+ *
+ * The contract is mirrored here rather than imported, for the same reason
+ * `createUserMessage` is inlined in `index.js`: a link install resolves imports
+ * from the checkout path, where in-box harness packages are unreachable.
+ * Sources: `ToolCallView` in `@deepseek-ai/dsh-tools/src/presentation.ts`,
+ * `toolEventViewSchema` in `@deepseek-ai/dsh-apiproxy/src/api/sessions.schema.ts`.
+ */
+const CALL_VIEW_SHAPES = {
+  generic: { required: ['title'], optional: ['kind', 'rawInput', 'content', 'locations'] },
+  terminal: { required: ['title'], optional: ['description', 'cwd'] },
+  diff: { required: ['title', 'diffs'], optional: ['locations'] },
+}
+
+/** `ToolCallKind`. A UI picks its icon from this closed vocabulary. */
+const CALL_KINDS = new Set(['read', 'edit', 'delete', 'move', 'search', 'execute', 'fetch', 'other'])
+
+function assertValidCallView(view, label) {
+  assert.equal(typeof view, 'object', `${label}: view must be an object`)
+  assert.notEqual(view, null, `${label}: view must not be null`)
+  // The exact failure a malformed view produces on the wire:
+  // `{"expected":"string","code":"invalid_type","path":["events",N,"view","view","card"]}`.
+  assert.equal(typeof view.card, 'string', `${label}: view.card must be a string discriminant`)
+  const shape = CALL_VIEW_SHAPES[view.card]
+  assert.ok(shape, `${label}: unknown card '${view.card}'`)
+  for (const field of shape.required) {
+    assert.ok(field in view, `${label}: card '${view.card}' requires ${field}`)
+  }
+  const known = new Set(['card', ...shape.required, ...shape.optional])
+  for (const key of Object.keys(view)) {
+    // An unknown key survives the loose wire schema and is then silently
+    // dropped by the UI - the input a card was meant to show goes missing.
+    assert.ok(known.has(key), `${label}: card '${view.card}' has no field '${key}'`)
+  }
+  assert.equal(typeof view.title, 'string', `${label}: title must be a string`)
+  assert.ok(view.title.length > 0, `${label}: title must not be empty`)
+  if ('kind' in view) assert.ok(CALL_KINDS.has(view.kind), `${label}: unknown kind '${view.kind}'`)
+}
+
+describe('pending-call presentation', () => {
+  /** Arguments as the model would send them, per tool. */
+  const REALISTIC_ARGS = {
+    memory_search: { query: 'pnpm', limit: 5 },
+    memory_remember: { kind: 'rule', title: 'Use pnpm', summary: 'Always use pnpm in this repo.' },
+    memory_forget_preview: { query: 'pnpm' },
+    memory_forget_confirm: { preview_token: 'tok', memory_ids: ['a', 'b'] },
+    memory_status: {},
+    memory_reconcile: {},
+  }
+
+  it('returns a card-tagged view the host transcript schema accepts', () => {
+    const { agentCtx, ledger } = setup()
+    for (const [name, definition] of agentCtx.registeredTools) {
+      assert.equal(typeof definition.presentCall, 'function', `${name} declares no presentCall`)
+      assertValidCallView(definition.presentCall(REALISTIC_ARGS[name]), name)
+    }
+    ledger.close()
+  })
+
+  it('still returns a valid view for arguments logged by an older build', () => {
+    const { agentCtx, ledger } = setup()
+    // History replay feeds back whatever was stored, parsed but never
+    // re-validated, so a presenter that assumes its own current parameters
+    // would throw and drop the card for every past call.
+    for (const [name, definition] of agentCtx.registeredTools) {
+      for (const args of [undefined, {}, { unexpected: 1 }]) {
+        assertValidCallView(definition.presentCall(args), `${name} with ${JSON.stringify(args)}`)
+      }
+    }
+    ledger.close()
+  })
+})

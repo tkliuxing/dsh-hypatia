@@ -173,7 +173,7 @@ export function registerMemoryTools(deps) {
         return toolError(error)
       }
     },
-    presentCall: (args) => ({ tag: 'card', title: 'Search memory', kind: 'read', input: String(args?.query ?? '') }),
+    presentCall: (args) => ({ card: 'generic', title: 'Search memory', kind: 'read', rawInput: String(args?.query ?? '') }),
   })
 
   // --- memory_remember --------------------------------------------------
@@ -293,7 +293,7 @@ export function registerMemoryTools(deps) {
         return toolError(error)
       }
     },
-    presentCall: (args) => ({ tag: 'card', title: 'Remember', kind: 'other', input: String(args?.title ?? '') }),
+    presentCall: (args) => ({ card: 'generic', title: 'Remember', kind: 'other', rawInput: String(args?.title ?? '') }),
   })
 
   // --- memory_forget_preview -------------------------------------------
@@ -419,7 +419,7 @@ export function registerMemoryTools(deps) {
         return toolError(error)
       }
     },
-    presentCall: (args) => ({ tag: 'card', title: 'Preview forget', kind: 'read', input: String(args?.query ?? '') }),
+    presentCall: (args) => ({ card: 'generic', title: 'Preview forget', kind: 'read', rawInput: String(args?.query ?? '') }),
   })
 
   // --- memory_forget_confirm -------------------------------------------
@@ -518,10 +518,10 @@ export function registerMemoryTools(deps) {
       }
     },
     presentCall: (args) => ({
-      tag: 'card',
+      card: 'generic',
       title: 'Forget memories',
       kind: 'other',
-      input: `${Array.isArray(args?.memory_ids) ? args.memory_ids.length : 0} entries`,
+      rawInput: `${Array.isArray(args?.memory_ids) ? args.memory_ids.length : 0} entries`,
     }),
   })
 
@@ -588,7 +588,7 @@ export function registerMemoryTools(deps) {
         return toolError(error)
       }
     },
-    presentCall: () => ({ tag: 'card', title: 'Memory status', kind: 'read' }),
+    presentCall: () => ({ card: 'generic', title: 'Memory status', kind: 'read' }),
   })
 
   // --- memory_reconcile -------------------------------------------------
@@ -629,7 +629,7 @@ export function registerMemoryTools(deps) {
         return toolError(error)
       }
     },
-    presentCall: () => ({ tag: 'card', title: 'Reconcile memory', kind: 'other' }),
+    presentCall: () => ({ card: 'generic', title: 'Reconcile memory', kind: 'other' }),
   })
 
   return () => {
