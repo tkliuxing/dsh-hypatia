@@ -18,6 +18,8 @@ What you get:
 
 **The `hypatia` command must be on your PATH,** and **Node 22.5+** (the control ledger uses `node:sqlite`). At load the plugin resolves the binary to an absolute path and checks its version; if either fails it logs a warning and memory stays inactive.
 
+The adapter is written against the **hypatia 0.1.4** CLI contract and refuses anything older, because its output classification depends on observed per-command behaviour rather than exit codes. Override with `adapter.minVersion`, or set `adapter.requireVersionCheck: false` to proceed unverified.
+
 ```sh
 git clone https://github.com/MarchLiu/hypatia
 cd hypatia && cargo build --release
@@ -33,26 +35,30 @@ cp /tmp/bge-m3/onnx/tokenizer.json ~/.hypatia/default/tokenizer.json
 
 ## Installation
 
-The published package is **`@tkliuxing/dsh-hypatia`**. The unscoped `dsh-hypatia`
-name on npm belongs to this project's pre-rewrite release and is not updated.
-
 ```sh
-# From a local path (development or source checkout)
-dsh plugin --profile web add /path/to/dsh-hypatia
+# From npm
+dsh plugin --profile web add @tkliuxing/dsh-hypatia
 
 # Straight from GitHub (plain JS, no build step)
 dsh plugin --profile web add github:tkliuxing/dsh-hypatia
+
+# From a local path, for development against a checkout
+dsh plugin --profile web add /path/to/dsh-hypatia
 
 # When running dsh from a source checkout, use pnpm dsh instead:
 pnpm dsh plugin --profile web add /path/to/dsh-hypatia
 ```
 
-Upgrading from an install made under the old unscoped name? Remove it first, or
-the profile carries two entries for one plugin:
+The published package is **`@tkliuxing/dsh-hypatia`**. The unscoped `dsh-hypatia`
+name on npm belongs to this project's pre-rewrite release and is not updated.
+
+Upgrading from an install made under that old name? Remove it first, or the
+profile carries two entries for one plugin — and, because both resolve to the
+same code, the plugin can load twice against one ledger:
 
 ```sh
 dsh plugin --profile web remove dsh-hypatia
-dsh plugin --profile web add /path/to/dsh-hypatia
+dsh plugin --profile web add @tkliuxing/dsh-hypatia
 ```
 
 **Restart dsh** after installing or after editing `index.js`, `src/`, or `skills/`.
@@ -97,6 +103,7 @@ Unmodified Hypatia CLI
 | `src/adapter/` | the one place a subprocess is spawned |
 | `src/mutations.js` | intent → CLI → read-back verification → receipt |
 | `src/recall.js` | same-request recall inside `agent/pre-step` |
+| `src/retry-driver.js` | drains the retry queue inside the session that scheduled it |
 | `src/tools.js` | the narrow `memory_*` tools |
 | `src/ingest/` | idempotent ingestion of DSH compaction summaries |
 
@@ -164,22 +171,25 @@ These are deliberate, and the plugin reports them rather than papering over them
 
 - **One process at a time.** Every `hypatia` invocation opens all registered shelves and DuckDB takes an exclusive file lock, so concurrent invocations fail with `Conflicting lock is held` — measured at 3 failures out of 4 concurrent `hypatia query` calls against hypatia 0.1.4. The adapter therefore serializes every call, reads included. Raise `maxConcurrentReads` only if nothing else can touch the same shelves.
 - **Deletion is scoped honestly.** Forget tombstones a record immediately, deletes it from the active shelf, and verifies absence. It cannot reach Hypatia exports, backups, other shelves, unknown user-created relations, or the DSH transcript — and reports `cleanup-uncertain` instead of claiming success when verification is incomplete.
+- **A failing write retries three times, then stops.** Backoff is 1s, 5s, 30s; after that the operation is dead-lettered and `memory_status` counts it. Retries are drained in-session by an armed timer, not a poll, so a transient lock conflict settles without waiting for the next dsh start — but nothing retries forever, and a payload conflict is never retried at all.
 - **Vector recall is off by default.** Hypatia's top-K cannot pre-filter by scope, so results must be over-fetched and filtered afterwards. Enable `recall.vectorSupplement` only after benchmarking your dataset.
 - **Background extraction is not implemented.** GOAL.md gates it NO-GO until the Phase 0–2 fault and security tests pass; setting `extraction.enabled` logs a warning and changes nothing.
 - **Full-transcript mirroring is not implemented.** It stays off until its consent, retention, and cleanup prerequisites exist.
 
 ## Performance
 
-`npm run bench` measures the CLI against the configured recall deadline on a throwaway shelf it creates and removes. Measured on hypatia 0.1.4, Node 22.22, darwin/arm64:
+`npm run bench` measures the CLI against the configured recall deadline on a throwaway shelf it creates and removes. Re-measured on hypatia 0.1.4, Node 22.22.3, darwin/arm64:
 
-| Records | Concurrency | full recall P50 | P95 | Within 200 ms deadline |
-|---|---|---|---|---|
-| 100 | 1 | 43 ms | 45 ms | yes |
-| 100 | 4 | 93 ms | 176 ms | yes |
-| 500 | 1 | 45 ms | 50 ms | yes |
-| 500 | 4 | 96 ms | 185 ms | yes |
+| Records | Concurrency | full recall P50 | P95 | max | Within 200 ms deadline |
+|---|---|---|---|---|---|
+| 100 | 1 | 47.8 ms | 52.2 ms | 58.2 ms | yes |
+| 100 | 4 | 97.8 ms | 189.2 ms | 190.0 ms | yes |
+| 1,000 | 1 | 50.3 ms | 54.9 ms | 61.8 ms | yes |
+| 1,000 | 4 | 100.4 ms | 198.9 ms | 199.1 ms | yes |
 
-Serialized concurrency is the cost driver, not dataset size: four concurrent sessions land near the deadline while ten times the records barely moves it. If your deployment needs more concurrency, that is the number to re-measure first.
+Serialized concurrency is the cost driver, not dataset size: ten times the records costs about 3 ms, while four concurrent sessions roughly quadruple the P95.
+
+Read the last row carefully. It clears the deadline by about 1 ms, and the individual `jse query` and `fts search` operations behind it already miss it (P95 203.4 ms, max 207.6 ms). Recall fails open, so exceeding the deadline costs coverage rather than turns — but **four concurrent sessions at 1,000 records is the measured ceiling**, not a comfortable margin. Re-measure before raising `adapter.maxConcurrentReads` or planning for a larger corpus.
 
 ## Development
 

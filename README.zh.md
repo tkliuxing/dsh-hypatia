@@ -18,6 +18,8 @@
 
 **`hypatia` 命令必须在 PATH 上**，并且需要 **Node 22.5+**（控制账本使用 `node:sqlite`）。插件加载时会把二进制解析为绝对路径并检查版本；任一步失败都会记录警告，记忆功能保持关闭。
 
+适配器是按 **hypatia 0.1.4** 的 CLI 契约写的，低于该版本会被拒绝 —— 因为它对输出的判定依赖逐个命令实测到的行为，而不是退出码。可用 `adapter.minVersion` 覆盖，或设 `adapter.requireVersionCheck: false` 跳过校验。
+
 ```sh
 git clone https://github.com/MarchLiu/hypatia
 cd hypatia && cargo build --release
@@ -33,25 +35,29 @@ cp /tmp/bge-m3/onnx/tokenizer.json ~/.hypatia/default/tokenizer.json
 
 ## 安装
 
-发布的包名是 **`@tkliuxing/dsh-hypatia`**。npm 上未加 scope 的 `dsh-hypatia`
-属于本项目重写之前的版本，不再更新。
-
 ```sh
-# 从本地路径安装（开发或源码检出）
-dsh plugin --profile web add /path/to/dsh-hypatia
+# 从 npm 安装
+dsh plugin --profile web add @tkliuxing/dsh-hypatia
 
 # 直接从 GitHub 安装（纯 JS，无构建步骤）
 dsh plugin --profile web add github:tkliuxing/dsh-hypatia
+
+# 从本地路径安装，用于对着源码检出开发
+dsh plugin --profile web add /path/to/dsh-hypatia
 
 # 从源码检出运行 dsh 时，改用 pnpm dsh：
 pnpm dsh plugin --profile web add /path/to/dsh-hypatia
 ```
 
-如果之前是按旧的无 scope 包名装的，先移除再安装，否则 profile 里会留下同一个插件的两条记录：
+发布的包名是 **`@tkliuxing/dsh-hypatia`**。npm 上未加 scope 的 `dsh-hypatia`
+属于本项目重写之前的版本，不再更新。
+
+如果之前是按旧包名装的，先移除再安装，否则 profile 里会留下同一个插件的两条记录 ——
+而且两条都指向同一份代码，插件可能对着同一个账本被加载两次：
 
 ```sh
 dsh plugin --profile web remove dsh-hypatia
-dsh plugin --profile web add /path/to/dsh-hypatia
+dsh plugin --profile web add @tkliuxing/dsh-hypatia
 ```
 
 安装后、以及修改 `index.js`、`src/`、`skills/` 后，都需要**重启 dsh**。
@@ -96,6 +102,7 @@ dsh-hypatia 宿主插件
 | `src/adapter/` | 全插件唯一创建子进程的地方 |
 | `src/mutations.js` | 意图 → CLI → 回读校验 → 回执 |
 | `src/recall.js` | `agent/pre-step` 中的同请求召回 |
+| `src/retry-driver.js` | 在排入重试的那个会话内排空重试队列 |
 | `src/tools.js` | 收窄的 `memory_*` 工具 |
 | `src/ingest/` | 幂等地吸收 DSH 压缩摘要 |
 
@@ -158,22 +165,25 @@ dsh-hypatia 宿主插件
 
 - **同时只跑一个进程。** 每次 `hypatia` 调用都会打开所有已注册的 shelf，而 DuckDB 会取独占文件锁，因此并发调用会以 `Conflicting lock is held` 失败 —— 在 hypatia 0.1.4 上实测 4 个并发 `hypatia query` 有 3 个失败。因此适配器把所有调用（包括读）串行化。只有在确定没有其他进程会碰同一批 shelf 时，才提高 `maxConcurrentReads`。
 - **删除的保证范围是诚实的。** 遗忘会立刻打上墓碑、从当前 shelf 删除并校验其不存在。它无法触及 Hypatia 导出、备份、其他 shelf、用户自建的未知关系，以及 DSH 转录；校验不完整时汇报 `cleanup-uncertain`，而不是宣称成功。
+- **失败的写入重试三次后停止。** 退避为 1s、5s、30s，之后该操作进入 dead-letter，并计入 `memory_status`。重试由触发式定时器在本会话内排空（不是轮询），因此一次瞬时的锁冲突无需等到下次启动 dsh 就能结算 —— 但不会无限重试，而载荷冲突则完全不重试。
 - **向量召回默认关闭。** Hypatia 的 top-K 无法先按 scope 过滤，只能超量取回再过滤。请先在你的数据规模上跑基准，再开启 `recall.vectorSupplement`。
 - **后台抽取尚未实现。** GOAL.md 将其标为 NO-GO，直到 Phase 0–2 的故障与安全测试通过；设置 `extraction.enabled` 只会记录一条警告，不改变行为。
 - **整份转录镜像尚未实现。** 在其同意、留存与清理前置条件具备之前保持关闭。
 
 ## 性能
 
-`npm run bench` 会在自建并自动清理的临时 shelf 上，按配置的召回截止时间测量 CLI。在 hypatia 0.1.4、Node 22.22、darwin/arm64 上实测：
+`npm run bench` 会在自建并自动清理的临时 shelf 上，按配置的召回截止时间测量 CLI。在 hypatia 0.1.4、Node 22.22.3、darwin/arm64 上重新实测：
 
-| 记录数 | 并发 | 完整召回 P50 | P95 | 是否满足 200 ms |
-|---|---|---|---|---|
-| 100 | 1 | 43 ms | 45 ms | 是 |
-| 100 | 4 | 93 ms | 176 ms | 是 |
-| 500 | 1 | 45 ms | 50 ms | 是 |
-| 500 | 4 | 96 ms | 185 ms | 是 |
+| 记录数 | 并发 | 完整召回 P50 | P95 | max | 是否满足 200 ms |
+|---|---|---|---|---|---|
+| 100 | 1 | 47.8 ms | 52.2 ms | 58.2 ms | 是 |
+| 100 | 4 | 97.8 ms | 189.2 ms | 190.0 ms | 是 |
+| 1,000 | 1 | 50.3 ms | 54.9 ms | 61.8 ms | 是 |
+| 1,000 | 4 | 100.4 ms | 198.9 ms | 199.1 ms | 是 |
 
-真正的成本来源是串行化后的并发，而不是数据规模：四个并发会话已逼近截止线，而记录数翻十倍几乎没有影响。如果你的部署需要更高并发，这就是首先要重新测量的数字。
+真正的成本来源是串行化后的并发，而不是数据规模：记录数翻十倍只多约 3 ms，而并发翻到四个会话会让 P95 变成大约四倍。
+
+最后一行要仔细看。它只以约 1 ms 的余量压线通过，而支撑它的 `jse query` 与 `fts search` 单项其实已经超了（P95 203.4 ms，max 207.6 ms）。召回失败即放行，所以超时的代价是覆盖率而不是这一轮对话 —— 但**四并发 / 1000 条记录已是实测天花板**，不是一段宽裕的余量。在提高 `adapter.maxConcurrentReads` 或规划更大的记忆规模之前，请重新测量。
 
 ## 开发
 
