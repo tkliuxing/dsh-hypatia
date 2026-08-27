@@ -33,6 +33,9 @@ cp /tmp/bge-m3/onnx/tokenizer.json ~/.hypatia/default/tokenizer.json
 
 ## 安装
 
+发布的包名是 **`@tkliuxing/dsh-hypatia`**。npm 上未加 scope 的 `dsh-hypatia`
+属于本项目重写之前的版本，不再更新。
+
 ```sh
 # 从本地路径安装（开发或源码检出）
 dsh plugin --profile web add /path/to/dsh-hypatia
@@ -44,18 +47,26 @@ dsh plugin --profile web add github:tkliuxing/dsh-hypatia
 pnpm dsh plugin --profile web add /path/to/dsh-hypatia
 ```
 
+如果之前是按旧的无 scope 包名装的，先移除再安装，否则 profile 里会留下同一个插件的两条记录：
+
+```sh
+dsh plugin --profile web remove dsh-hypatia
+dsh plugin --profile web add /path/to/dsh-hypatia
+```
+
 安装后、以及修改 `index.js`、`src/`、`skills/` 后，都需要**重启 dsh**。
 
 ## 使用
 
-召回与摘要入库是自动的。除此之外，agent 会代你使用这五个工具：
+召回与摘要入库是自动的。除此之外，agent 会代你使用这六个工具：
 
 | 你说 | 发生什么 |
 |---|---|
 | "记住：本项目禁止使用 eval" | `memory_remember` 在当前项目 scope 下存入一条用户确认的规则 |
 | "关于重试策略我们知道些什么？" | `memory_search` 返回本项目的记忆，并标注为参考资料 |
 | "忘掉旧 API 的相关内容" | `memory_forget_preview` 先列出确切条目；`memory_forget_confirm` 只删除你批准的那些 |
-| "刚才那条真的存下来了吗？" | `memory_status` 汇报已校验、待处理、不确定的数量 |
+| "刚才那条真的存下来了吗？" | `memory_status` 汇报已校验、待处理、不确定的数量，以及自动召回实际覆盖了项目记忆的多少 |
+| "把还没确认的那些结算掉" | `memory_reconcile` 按稳定键重新核对未验证的操作并结算 |
 
 知识图谱管理类操作 —— shelf、归档、向量模型、导出，或刻意不限 scope 的全图检索 —— 由 `hypatia` skill 直接驱动 CLI，该路径确实需要 `danger-full-access`。
 
@@ -97,7 +108,7 @@ dsh-hypatia 宿主插件
 ```yaml
 - insert:
     - id: dsh-hypatia
-      name: 'dsh-hypatia'
+      name: '@tkliuxing/dsh-hypatia'
       config:
         memory:
           preset: standard      # disabled | read-only-recall | standard | full

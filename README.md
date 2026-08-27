@@ -33,6 +33,9 @@ cp /tmp/bge-m3/onnx/tokenizer.json ~/.hypatia/default/tokenizer.json
 
 ## Installation
 
+The published package is **`@tkliuxing/dsh-hypatia`**. The unscoped `dsh-hypatia`
+name on npm belongs to this project's pre-rewrite release and is not updated.
+
 ```sh
 # From a local path (development or source checkout)
 dsh plugin --profile web add /path/to/dsh-hypatia
@@ -44,18 +47,27 @@ dsh plugin --profile web add github:tkliuxing/dsh-hypatia
 pnpm dsh plugin --profile web add /path/to/dsh-hypatia
 ```
 
+Upgrading from an install made under the old unscoped name? Remove it first, or
+the profile carries two entries for one plugin:
+
+```sh
+dsh plugin --profile web remove dsh-hypatia
+dsh plugin --profile web add /path/to/dsh-hypatia
+```
+
 **Restart dsh** after installing or after editing `index.js`, `src/`, or `skills/`.
 
 ## Usage
 
-Recall and summary ingestion are automatic. Beyond that, the agent has five tools it uses on your behalf:
+Recall and summary ingestion are automatic. Beyond that, the agent has six tools it uses on your behalf:
 
 | You say | What happens |
 |---|---|
 | "remember: this project forbids eval" | `memory_remember` stores one user-confirmed rule in this project's scope |
 | "what do we know about the retry policy?" | `memory_search` returns this project's memories, labelled as reference data |
 | "forget what you know about the old API" | `memory_forget_preview` shows the exact entries first; `memory_forget_confirm` deletes only what you approved |
-| "did that actually save?" | `memory_status` reports verified, pending, and uncertain counts |
+| "did that actually save?" | `memory_status` reports verified, pending, and uncertain counts, plus how much of the project automatic recall scores |
+| "settle whatever is still unverified" | `memory_reconcile` re-checks unverified operations against the knowledge base by stable key |
 
 For knowledge-graph administration — shelves, archives, embedding models, export, or a deliberately unscoped search across the whole graph — the `hypatia` skill drives the CLI directly. That path does require `danger-full-access`.
 
@@ -97,7 +109,7 @@ Everything is optional; override on the cordis row:
 ```yaml
 - insert:
     - id: dsh-hypatia
-      name: 'dsh-hypatia'
+      name: '@tkliuxing/dsh-hypatia'
       config:
         memory:
           preset: standard      # disabled | read-only-recall | standard | full

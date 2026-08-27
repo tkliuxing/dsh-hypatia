@@ -1,4 +1,4 @@
 # dsh bundle patch: inserts the hypatia plugin into a profile's layer stack.
 - insert:
     - id: dsh-hypatia
-      name: 'dsh-hypatia'
+      name: '@tkliuxing/dsh-hypatia'
