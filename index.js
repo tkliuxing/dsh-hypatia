@@ -17,7 +17,6 @@
  *   src/recall.js        same-request recall inside `agent/pre-step`
  *   src/tools.js         the narrow `memory_*` tools, replacing model Bash
  *   src/ingest/          idempotent ingestion of DSH compaction summaries
- *   src/legacy-bridge.js the deprecated TRIGGER bridge, off by default
  *
  * See GOAL.md for the architecture this implements and the limits it refuses
  * to overstate.
@@ -34,7 +33,6 @@ import { normalizeConfig } from './src/config.js'
 import { deriveProjectIdentity } from './src/identity.js'
 import { registerCompactionIngest } from './src/ingest/compaction.js'
 import { openLedger } from './src/ledger/ledger.js'
-import { registerMemoryBridge } from './src/legacy-bridge.js'
 import { MutationCoordinator } from './src/mutations.js'
 import { Capability, createMemoryPolicy } from './src/policy.js'
 import { RecallService } from './src/recall.js'
@@ -58,8 +56,7 @@ export const name = 'dsh-hypatia'
  * Keep this list to services every profile really has. `tools` and
  * `sandboxPolicy` are deliberately absent: a missing service here is a hard
  * boot failure for the entire profile, whereas both of those degrade cleanly
- * (tools warn and are skipped; the legacy bridge treats an absent sandbox
- * policy as unrestricted, as it always has).
+ * (tools warn and are skipped).
  */
 export const inject = ['skills', 'agents']
 
@@ -129,18 +126,17 @@ export async function apply(ctx, rawConfig = {}) {
       + 'gated NO-GO in GOAL.md until the fault and security tests for Phases 0-2 pass.')
   }
 
-  // --- deprecated compatibility mode -----------------------------------
+  // --- removed compatibility mode --------------------------------------
   //
-  // Registered before the host path's gates, not after. The bridge does not
-  // use the policy, the adapter, or the ledger, and the configurations an
-  // operator would pair it with - `memory.preset: 'disabled'`, or a host
-  // without the CLI - are exactly the ones that return early below. Behind
-  // those returns, `legacyBridge.enabled: true` would be silently ignored.
-  if (config.legacyBridge.enabled) {
-    warn('legacyBridge is enabled: the deprecated TRIGGER/Bash memory protocol is active '
-      + 'alongside the host adapter. It injects protocol text into the durable transcript '
-      + 'and has no durable receipts. Disable it once the host path is verified.')
-    registerMemoryBridge(ctx, { extractInterval: config.legacyBridge.extractInterval, name, warn })
+  // Reported before the host path's gates, not after: the configurations an
+  // operator would have paired the bridge with - `memory.preset: 'disabled'`,
+  // or a host without the CLI - are exactly the ones that return early below,
+  // so a notice placed after them would never reach the deployment that needs
+  // it. The tools are the whole memory path now.
+  if (config.legacyBridge.requested) {
+    warn('legacyBridge.enabled is set but the deprecated TRIGGER/Bash memory protocol has '
+      + 'been removed. Memory now runs entirely through the host adapter and the memory_* '
+      + 'tools; drop the key from this profile.')
   }
 
   const policy = createMemoryPolicy({ ...config.memory, warn })
@@ -309,10 +305,3 @@ export async function apply(ctx, rawConfig = {}) {
     installMemory()
   }
 }
-
-/**
- * Re-exported for the legacy bridge's own tests and for operators pinning the
- * compatibility mode. New code should not call this.
- * @deprecated use the host adapter path; see GOAL.md "Current Compatibility Bridge".
- */
-export { registerMemoryBridge }

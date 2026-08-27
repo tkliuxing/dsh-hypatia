@@ -255,9 +255,15 @@ describe('configuration', () => {
     assert.equal(config.extraction.requested, true)
   })
 
-  it('keeps the legacy bridge off by default', () => {
+  it('keeps the removed legacy bridge off and still records that it was asked for', () => {
     assert.equal(normalizeConfig({}).legacyBridge.enabled, false)
-    assert.equal(normalizeConfig({ legacyBridge: { enabled: true } }).legacyBridge.enabled, true)
+    assert.equal(normalizeConfig({}).legacyBridge.requested, false)
+
+    // The flag survives normalization only so `apply()` can tell the operator
+    // the bridge is gone. It must never turn anything back on.
+    const stale = normalizeConfig({ legacyBridge: { enabled: true } })
+    assert.equal(stale.legacyBridge.enabled, false)
+    assert.equal(stale.legacyBridge.requested, true)
   })
 
   it('ignores a relative binary path, which would be ambiguous at spawn time', () => {

@@ -118,12 +118,15 @@ export function normalizeConfig(raw = {}) {
     }),
 
     /**
-     * The pre-refactor TRIGGER/Bash bridge. Off by default; kept only as an
-     * explicit legacy escape hatch during migration. No new features.
+     * The pre-refactor TRIGGER/Bash bridge, removed after migration.
+     *
+     * The key is still read so a profile that carries the old flag is told the
+     * bridge is gone. Dropping it silently would leave an operator believing a
+     * memory path is running that no longer exists.
      */
     legacyBridge: Object.freeze({
-      enabled: bool(legacy.enabled, false),
-      extractInterval: num(legacy.extractInterval, 5, { min: 1, max: 1_000 }),
+      enabled: false,
+      requested: bool(legacy.enabled, false),
     }),
 
     /** Register the packaged skills in the session skill catalog. */

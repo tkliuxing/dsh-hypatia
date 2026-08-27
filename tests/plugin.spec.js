@@ -397,22 +397,24 @@ describe('skill registration', () => {
   })
 })
 
-describe('deprecated bridge registration', () => {
-  it('honours legacyBridge.enabled even when the host memory path is off', async () => {
-    // The configuration an operator migrating off TRIGGER would actually use:
-    // keep the old path only, while the host path is still being evaluated.
+describe('removed bridge configuration', () => {
+  it('tells a profile still carrying legacyBridge.enabled that the bridge is gone', async () => {
+    // The configuration an operator who never finished migrating would still
+    // have: the old path only, while the host path was being evaluated. It
+    // must not boot silently into a session with no memory path at all.
     const ctx = makeContext()
     await apply(ctx, config({ memory: { preset: 'disabled' }, legacyBridge: { enabled: true } }))
 
-    assert.equal(ctx.has('agent/turn-stopping'), true)
-    assert.equal(ctx.has('agent/session-start'), true)
-    assert.match(ctx.warnings.join('\n'), /legacyBridge is enabled/)
+    assert.equal(ctx.has('agent/turn-stopping'), false)
+    assert.equal(ctx.has('agent/session-start'), false)
+    assert.match(ctx.warnings.join('\n'), /legacyBridge\.enabled is set but .* has been removed/s)
   })
 
-  it('still stays off by default under the same configuration', async () => {
+  it('says nothing when the key is absent', async () => {
     const ctx = makeContext()
     await apply(ctx, config({ memory: { preset: 'disabled' } }))
 
     assert.equal(ctx.has('agent/turn-stopping'), false)
+    assert.doesNotMatch(ctx.warnings.join('\n'), /legacyBridge/)
   })
 })
