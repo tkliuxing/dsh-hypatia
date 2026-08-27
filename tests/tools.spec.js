@@ -18,10 +18,10 @@ import { FakeAdapter, FakeContext } from './helpers/fake-adapter.js'
 
 const SCOPE = 'proj-a'
 
-function setup({ preset = 'full' } = {}) {
+function setup({ preset = 'full', config: configOverrides = {} } = {}) {
   const ledger = openLedger(':memory:')
   const adapter = new FakeAdapter()
-  const config = normalizeConfig({})
+  const config = normalizeConfig(configOverrides)
   const policy = createMemoryPolicy({ preset })
   const warnings = []
   const warn = (message) => warnings.push(message)
@@ -523,6 +523,133 @@ describe('pending-call presentation', () => {
         assertValidCallView(definition.presentCall(args), `${name} with ${JSON.stringify(args)}`)
       }
     }
+    ledger.close()
+  })
+})
+
+/**
+ * A capped list must announce its cap - the same rule `memory_forget_preview`
+ * already follows. Here the stake is different but no smaller: a model that
+ * reads a silently truncated search as "this project has no such memory" will
+ * tell the user something false, and then act on it.
+ */
+describe('memory_search coverage', () => {
+  async function remember(call, index) {
+    return call('memory_remember', {
+      kind: 'decision',
+      title: `decision ${index}`,
+      summary: `we decided thing number ${index}`,
+    })
+  }
+
+  it('reports the scan as complete when everything in scope was searched', async () => {
+    const { call, ledger } = setup({ config: { recall: { searchScanLimit: 50 } } })
+    await remember(call, 1)
+    await remember(call, 2)
+
+    const result = await call('memory_search', { query: 'decision' })
+
+    assert.equal(result.truncated, false)
+    assert.equal(result.scanned, 2)
+    assert.equal(result.total_in_scope, 2)
+    assert.doesNotMatch(result.note, /were searched/)
+    ledger.close()
+  })
+
+  it('announces the cap, with real numbers, when it could not search everything', async () => {
+    const { call, ledger } = setup({ config: { recall: { searchScanLimit: 2 } } })
+    for (let i = 0; i < 5; i += 1) await remember(call, i)
+
+    const result = await call('memory_search', { query: 'decision' })
+
+    assert.equal(result.truncated, true)
+    assert.equal(result.scanned, 2)
+    assert.equal(result.total_in_scope, 5)
+    assert.match(result.note, /Only the 2 most recent of 5 memories/)
+    assert.match(result.note, /an older match may exist/)
+    ledger.close()
+  })
+
+  it('does not let a wider scan limit leak another project into the total', async () => {
+    const { call, ledger } = setup({ config: { recall: { searchScanLimit: 1 } } })
+    await remember(call, 1)
+    await remember(call, 2)
+    // A record belonging to another project, written straight to the ledger.
+    ledger.beginOperation({
+      operationId: 'op-other',
+      memoryId: 'other-1',
+      verb: 'create',
+      scope: 'proj-b',
+      shelf: 'default',
+      hypatiaName: 'dshmem:v1:bbbb:other-1',
+      kind: 'decision',
+      title: 'decision elsewhere',
+      payload: { title: 'decision elsewhere' },
+      payloadHash: 'hash-other',
+    })
+    ledger.markDispatched('op-other')
+    ledger.commitReceipt('op-other', { verified: true })
+
+    const result = await call('memory_search', { query: 'decision' })
+
+    assert.equal(result.total_in_scope, 2, 'the cap is reported against this scope, never the whole ledger')
+    ledger.close()
+  })
+})
+
+describe('memory_status coverage reporting', () => {
+  it('reports how much of the project automatic recall actually scores', async () => {
+    const { call, ledger } = setup({ config: { recall: { candidatePool: 2 } } })
+    for (let i = 0; i < 5; i += 1) {
+      await call('memory_remember', { kind: 'decision', title: `d${i}`, summary: `s${i}` })
+    }
+
+    const status = await call('memory_status', {})
+
+    assert.deepEqual(status.recall_coverage, { active: 5, scored_per_turn: 2, truncated: true })
+    ledger.close()
+  })
+
+  it('does not claim truncation when the whole project fits in the pool', async () => {
+    const { call, ledger } = setup({ config: { recall: { candidatePool: 50 } } })
+    await call('memory_remember', { kind: 'decision', title: 'only one', summary: 'body' })
+
+    const status = await call('memory_status', {})
+
+    assert.deepEqual(status.recall_coverage, { active: 1, scored_per_turn: 1, truncated: false })
+    ledger.close()
+  })
+})
+
+describe('memory_reconcile honesty', () => {
+  it('says everything is settled when it is', async () => {
+    const { call, ledger } = setup()
+    await call('memory_remember', { kind: 'decision', title: 'settled', summary: 'body' })
+
+    const result = await call('memory_reconcile', {})
+
+    assert.equal(result.truncated, false)
+    assert.equal(result.remaining, 0)
+    assert.match(result.note, /Everything tracked is settled/)
+    ledger.close()
+  })
+
+  it('tells the model to stop rather than loop on work reconciliation cannot finish', async () => {
+    const { call, ledger, adapter } = setup()
+    // A write that never lands leaves an operation reconciliation will keep
+    // finding; once its record is forgotten, no further pass can settle it.
+    adapter.knowledgeCreate = async () => ({ ok: true, text: 'Created knowledge: x' })
+    const written = await call('memory_remember', { kind: 'decision', title: 'stuck', summary: 'body' })
+    ledger.tombstone(written.memory_id, 'user asked')
+    ledger.setCleanupState(written.memory_id, 'complete')
+
+    const result = await call('memory_reconcile', {})
+
+    assert.equal(result.truncated, false)
+    assert.ok(result.remaining > 0)
+    assert.match(result.note, /cannot be settled/)
+    assert.match(result.note, /Running again will not change that/)
+    assert.doesNotMatch(result.note, /Run memory_reconcile again/)
     ledger.close()
   })
 })

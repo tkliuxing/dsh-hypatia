@@ -160,7 +160,10 @@ export async function apply(ctx, rawConfig = {}) {
   }
 
   const shelf = config.adapter.shelf
-  const mutations = new MutationCoordinator({ ledger, adapter, shelf, warn })
+
+  const mutations = new MutationCoordinator({
+    ledger, adapter, shelf, warn, batchSize: config.reconcile.batchSize,
+  })
   const recall = new RecallService({ ledger, adapter, policy, config, warn })
 
   /** Host-derived scope for an agent. Never model-supplied. */
@@ -187,6 +190,9 @@ export async function apply(ctx, rawConfig = {}) {
   //
   // Runs after downstream listeners so their decision is preserved, and
   // appends at most one message to the accepted decision.
+
+  /** Scopes whose recall coverage ceiling has already been reported. */
+  const coverageWarned = new Set()
   ctx.on('agent/pre-step', async ({ agent, messages, step, signal }, next) => {
     const decision = await next()
     if (decision.kind === 'reject' || signal?.aborted) return decision
@@ -204,8 +210,18 @@ export async function apply(ctx, rawConfig = {}) {
       if (!queryText) return decision
 
       const scope = scopeOf(agent)
-      const { entries, degraded } = await recall.recall({ scope, shelf, queryText, signal })
+      const { entries, degraded, coverage } = await recall.recall({ scope, shelf, queryText, signal })
       if (degraded) warn(`recall degraded: ${degraded}`)
+      // A coverage ceiling is not a fault, so it must not be reported as one -
+      // but it must be reported. Once per scope per process: this runs on every
+      // first step, and a per-turn line would be ignored as noise by the time
+      // it mattered.
+      if (coverage?.truncated && !coverageWarned.has(scope)) {
+        coverageWarned.add(scope)
+        warn(`recall scored the ${coverage.considered} most recent of ${coverage.totalInScope} `
+          + `memories in ${scope}; older ones reach the model only through the hypatia `
+          + 'full-text supplement. Raise `recall.candidatePool` to widen the pool.')
+      }
       if (entries.length === 0) return decision
 
       return {

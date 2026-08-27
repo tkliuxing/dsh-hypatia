@@ -44,6 +44,7 @@ export function normalizeConfig(raw = {}) {
   const adapter = raw.adapter ?? {}
   const legacy = raw.legacyBridge ?? {}
   const ingest = raw.ingest ?? {}
+  const reconcile = raw.reconcile ?? {}
   const extraction = raw.extraction ?? {}
   const memory = raw.memory ?? {}
 
@@ -96,6 +97,22 @@ export function normalizeConfig(raw = {}) {
       deadlineMs: num(recall.deadlineMs, 200, { min: 25, max: 5_000 }),
       maxResults: num(recall.maxResults, 5, { min: 1, max: 25 }),
       maxBytes: num(recall.maxBytes, 10 * 1024, { min: 512, max: 64 * 1024 }),
+      /**
+       * How many ledger records automatic recall scores per turn.
+       *
+       * The pool is filled newest-first, so once a scope holds more records
+       * than this, an older-but-relevant memory reaches the model only through
+       * the Hypatia full-text supplement. That is a coverage ceiling, not a
+       * fault, so recall reports it as `coverage.truncated` instead of failing.
+       * Raising it costs one wider SQLite read per turn and no subprocess.
+       */
+      candidatePool: num(recall.candidatePool, 50, { min: 1, max: 5_000 }),
+      /**
+       * How many ledger records `memory_search` scores. Separate from
+       * `candidatePool`: the tool runs on demand rather than on every turn, so
+       * it can afford a wider scan, and it announces its own cap in `note`.
+       */
+      searchScanLimit: num(recall.searchScanLimit, 200, { min: 1, max: 5_000 }),
       /** Best-effort Hypatia FTS supplement inside the remaining deadline. */
       hypatiaSupplement: bool(recall.hypatiaSupplement, true),
       /** Vector recall cannot pre-filter by scope; off until benchmarked. */
@@ -105,6 +122,17 @@ export function normalizeConfig(raw = {}) {
     /** Idempotent ingestion of DSH compaction summaries. */
     ingest: Object.freeze({
       compaction: bool(ingest.compaction, true),
+    }),
+
+    /** Settling operations a crash, timeout, or lock contention left unverified. */
+    reconcile: Object.freeze({
+      /**
+       * Operations - and separately, cleanups - settled per reconciliation
+       * pass. A pass that fills its batch reports `truncated`, so a caller is
+       * told to run again rather than being left believing the ledger is
+       * settled.
+       */
+      batchSize: num(reconcile.batchSize, 50, { min: 1, max: 1_000 }),
     }),
 
     /**

@@ -410,3 +410,93 @@ describe('reconciliation drains stuck work', () => {
     assert.equal(adapter.knowledge.size, 1)
   })
 })
+
+/**
+ * Reconciliation is a batched pass over work that costs a subprocess each. A
+ * caller who cannot tell "the batch filled" from "nothing more can be done"
+ * either stops early believing the ledger is settled, or loops forever against
+ * entries reconciliation is structurally unable to finish.
+ */
+describe('reconciliation reports its own limits', () => {
+  /** Leave `count` operations stuck in `uncertain` with their keys absent. */
+  async function stickOperations(mutations, ledger, adapter, count) {
+    adapter.knowledgeCreate = async () => ({ ok: true, text: 'Created knowledge: x' })
+    for (let i = 0; i < count; i += 1) {
+      await mutations.writeMemory(request({
+        operationId: `op-${i}`,
+        memoryId: `mem-${i}`,
+        hypatiaName: `dshmem:v1:aaaa:mem-${i}`,
+      }))
+    }
+    assert.equal(ledger.countPendingOperations(), count)
+  }
+
+  it('says a pass was truncated when it filled its batch', async () => {
+    const { ledger, adapter, mutations } = setup()
+    await stickOperations(mutations, ledger, adapter, 4)
+
+    const summary = await mutations.reconcile({ limit: 2 })
+
+    assert.equal(summary.checked, 2)
+    assert.equal(summary.truncated, true, 'a full batch means work is left, so say so')
+    assert.ok(summary.remaining >= 2, `remaining was ${summary.remaining}`)
+    ledger.close()
+  })
+
+  it('does not claim truncation when the batch had room to spare', async () => {
+    const { ledger, adapter, mutations } = setup()
+    await stickOperations(mutations, ledger, adapter, 2)
+
+    const summary = await mutations.reconcile({ limit: 50 })
+
+    assert.equal(summary.checked, 2)
+    assert.equal(summary.truncated, false)
+    ledger.close()
+  })
+
+  it('separates "cannot be settled" from "run again", so a caller cannot loop', async () => {
+    // A tombstoned record is the honest example: reconciliation must never
+    // recreate it, so it stays counted as outstanding for good. Reporting only
+    // `remaining` would send the model back for another pass forever.
+    const { ledger, adapter, mutations } = setup()
+    adapter.knowledgeCreate = async () => ({ ok: true, text: 'Created knowledge: x' })
+    await mutations.writeMemory(request())
+    ledger.tombstone('mem-1', 'user asked')
+    ledger.setCleanupState('mem-1', CleanupState.COMPLETE)
+
+    const summary = await mutations.reconcile({ limit: 50 })
+
+    assert.equal(summary.unresolved, 1)
+    assert.equal(summary.truncated, false, 'nothing was cut short - another pass would find the same thing')
+    assert.ok(summary.remaining > 0, 'and it is still honestly counted as outstanding')
+    ledger.close()
+  })
+
+  it('takes its default batch size from the configured value', async () => {
+    const ledger = openLedger(':memory:')
+    const adapter = new FakeAdapter()
+    const mutations = new MutationCoordinator({
+      ledger, adapter, shelf: 'default', warn: () => {}, batchSize: 1,
+    })
+    await stickOperations(mutations, ledger, adapter, 3)
+
+    const summary = await mutations.reconcile()
+
+    assert.equal(summary.checked, 1, 'the configured batch size must apply without an explicit limit')
+    assert.equal(summary.truncated, true)
+    ledger.close()
+  })
+
+  it('counts the cleanups it finished', async () => {
+    const { ledger, adapter, mutations } = setup()
+    await mutations.writeMemory(request())
+    ledger.tombstone('mem-1', 'user asked')
+
+    const summary = await mutations.reconcile({ limit: 50 })
+
+    assert.equal(summary.cleanups, 1)
+    assert.equal(ledger.getTombstone('mem-1').cleanup_state, CleanupState.COMPLETE)
+    ledger.close()
+  })
+})
+

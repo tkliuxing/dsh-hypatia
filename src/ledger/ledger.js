@@ -321,6 +321,21 @@ export class Ledger {
     `).all(OperationState.PENDING, OperationState.DISPATCHED, OperationState.UNCERTAIN, limit)
   }
 
+  /**
+   * How many operations `pendingOperations` would return without a limit.
+   *
+   * Deliberately not `status().pendingOperations`: that one joins
+   * `memory_record` and carries the scope filter, so an operation whose record
+   * is missing is invisible there. A reconciliation pass has to page over the
+   * unjoined set, and can only report what it left behind if it counts the
+   * same rows it iterates.
+   */
+  countPendingOperations() {
+    return this.db.prepare(`
+      SELECT COUNT(*) AS count FROM memory_operation WHERE state IN (?, ?, ?)
+    `).get(OperationState.PENDING, OperationState.DISPATCHED, OperationState.UNCERTAIN)?.count ?? 0
+  }
+
   // --- records ----------------------------------------------------------
 
   getRecord(memoryId) {
@@ -432,6 +447,13 @@ export class Ledger {
        WHERE cleanup_state IN (?, ?)
        ORDER BY updated_at ASC LIMIT ?
     `).all(CleanupState.TOMBSTONED, CleanupState.UNCERTAIN, limit)
+  }
+
+  /** How many cleanups `pendingCleanups` would return without a limit. */
+  countPendingCleanups() {
+    return this.db.prepare(`
+      SELECT COUNT(*) AS count FROM memory_tombstone WHERE cleanup_state IN (?, ?)
+    `).get(CleanupState.TOMBSTONED, CleanupState.UNCERTAIN)?.count ?? 0
   }
 
   /**

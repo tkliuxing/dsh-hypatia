@@ -113,13 +113,15 @@ export class RecallService {
    * note, because a memory fault must not fail a user's turn.
    *
    * @param {{scope: string, shelf: string, queryText: string, signal?: AbortSignal}} request
-   * @returns {Promise<{entries: object[], degraded: string|null, tookMs: number}>}
+   * @returns {Promise<{entries: object[], degraded: string|null, tookMs: number,
+   *   coverage: {considered: number, totalInScope: number, truncated: boolean}}>}
    */
   async recall({ scope, shelf, queryText, signal }) {
     const settings = this.config.recall
     const deadline = new Deadline(settings.deadlineMs)
+    const coverage = { considered: 0, totalInScope: 0, truncated: false }
     if (!settings.enabled || !this.policy.can(Capability.READ_RECALL)) {
-      return { entries: [], degraded: null, tookMs: 0 }
+      return { entries: [], degraded: null, tookMs: 0, coverage }
     }
 
     let degraded = null
@@ -128,10 +130,21 @@ export class RecallService {
 
     // Baseline: exact-scope ledger records. Always available, no subprocess,
     // and the only path that is required to work.
+    //
+    // The pool is filled newest-first and capped, so a scope larger than the
+    // cap leaves older records unscored here. That is reported rather than
+    // hidden: a caller that believes recall saw everything will read an empty
+    // result as "the project has no such memory".
     try {
-      for (const row of this.ledger.recallCandidates({ scope, shelf, limit: 50 })) {
+      const rows = this.ledger.recallCandidates({ scope, shelf, limit: settings.candidatePool })
+      for (const row of rows) {
         byName.set(row.hypatia_name, this.#toEntry(row, terms, 'ledger'))
       }
+      coverage.considered = rows.length
+      coverage.totalInScope = rows.length < settings.candidatePool
+        ? rows.length
+        : this.ledger.countRecallCandidates({ scope, shelf })
+      coverage.truncated = coverage.totalInScope > coverage.considered
     } catch (error) {
       degraded = `ledger recall failed: ${error.message}`
     }
@@ -170,7 +183,7 @@ export class RecallService {
     }
 
     const entries = this.#rank([...byName.values()]).slice(0, settings.maxResults)
-    return { entries, degraded, tookMs: Date.now() - deadline.started }
+    return { entries, degraded, tookMs: Date.now() - deadline.started, coverage }
   }
 
   /**

@@ -236,3 +236,90 @@ describe('untrusted framing', () => {
     ledger.close()
   })
 })
+
+/**
+ * The ledger baseline is a capped, newest-first pool. The cap is a coverage
+ * ceiling rather than a fault, so it must be configurable and it must be
+ * reported - an unannounced cap makes "recall found nothing" indistinguishable
+ * from "recall never looked".
+ */
+describe('recall coverage ceiling', () => {
+  /** Seed `count` applied records, oldest first. */
+  function seedMany(ledger, count) {
+    for (let i = 0; i < count; i += 1) {
+      seed(ledger, { memoryId: `mem${String(i).padStart(3, '0')}`, title: `entry ${i}`, summary: 'body' })
+    }
+  }
+
+  it('reports no truncation when the scope fits inside the pool', async () => {
+    const { ledger, recall } = setup({ recall: { candidatePool: 10, hypatiaSupplement: false } })
+    seedMany(ledger, 4)
+
+    const result = await recall.recall({ scope: SCOPE, shelf: 'default', queryText: 'entry' })
+
+    assert.deepEqual(result.coverage, { considered: 4, totalInScope: 4, truncated: false })
+    ledger.close()
+  })
+
+  it('reports the exact ceiling when the scope is larger than the pool', async () => {
+    const { ledger, recall } = setup({ recall: { candidatePool: 5, hypatiaSupplement: false } })
+    seedMany(ledger, 12)
+
+    const result = await recall.recall({ scope: SCOPE, shelf: 'default', queryText: 'entry' })
+
+    assert.equal(result.coverage.considered, 5)
+    assert.equal(result.coverage.totalInScope, 12, 'the total must be the real count, not the pool size')
+    assert.equal(result.coverage.truncated, true)
+    ledger.close()
+  })
+
+  it('counts only this scope, so another project cannot inflate the ceiling', async () => {
+    const { ledger, recall } = setup({ recall: { candidatePool: 2, hypatiaSupplement: false } })
+    seedMany(ledger, 3)
+    seed(ledger, { memoryId: 'other1', scope: OTHER, title: 'entry x', summary: 'body' })
+    seed(ledger, { memoryId: 'other2', scope: OTHER, title: 'entry y', summary: 'body' })
+
+    const result = await recall.recall({ scope: SCOPE, shelf: 'default', queryText: 'entry' })
+
+    assert.equal(result.coverage.totalInScope, 3)
+    ledger.close()
+  })
+
+  it('widens the pool when configured, reaching a record the default would miss', async () => {
+    // The oldest record is the one a recency-ordered pool drops first, so it is
+    // the honest probe for whether `candidatePool` does anything at all. The
+    // seeds are separated in time because `updated_at` has millisecond
+    // resolution, and two writes inside one tick would tie.
+    const seedPair = async (ledger) => {
+      seed(ledger, { memoryId: 'older', title: 'duckdb lock', summary: 'serialize every call' })
+      await new Promise((resolve) => { setTimeout(resolve, 5) })
+      seed(ledger, { memoryId: 'newer', title: 'unrelated', summary: 'nothing to see' })
+    }
+
+    const narrow = setup({ recall: { candidatePool: 1, maxResults: 25, hypatiaSupplement: false } })
+    await seedPair(narrow.ledger)
+    const missed = await narrow.recall.recall({ scope: SCOPE, shelf: 'default', queryText: 'duckdb lock' })
+    assert.deepEqual(
+      missed.entries.map((entry) => entry.memoryId),
+      ['newer'],
+      'a one-record pool must hold the newest record, leaving the matching older one unscored',
+    )
+    assert.equal(missed.coverage.truncated, true)
+    narrow.ledger.close()
+
+    const wide = setup({ recall: { candidatePool: 50, maxResults: 25, hypatiaSupplement: false } })
+    await seedPair(wide.ledger)
+    const found = await wide.recall.recall({ scope: SCOPE, shelf: 'default', queryText: 'duckdb lock' })
+    assert.ok(found.entries.some((entry) => entry.memoryId === 'older'), 'the wider pool must score the older record')
+    assert.equal(found.coverage.truncated, false)
+    wide.ledger.close()
+  })
+
+  it('still reports a coverage object when recall is disabled, so callers need no guard', async () => {
+    const { ledger, recall } = setup({ recall: { enabled: false } })
+    const result = await recall.recall({ scope: SCOPE, shelf: 'default', queryText: 'anything' })
+
+    assert.deepEqual(result.coverage, { considered: 0, totalInScope: 0, truncated: false })
+    ledger.close()
+  })
+})

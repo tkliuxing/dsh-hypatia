@@ -30,13 +30,14 @@ export class MutationCoordinator {
   /**
    * @param {{ledger: import('./ledger/ledger.js').Ledger,
    *   adapter: import('./adapter/cli.js').HypatiaAdapter,
-   *   shelf: string, warn: (msg: string) => void}} deps
+   *   shelf: string, warn: (msg: string) => void, batchSize?: number}} deps
    */
-  constructor({ ledger, adapter, shelf, warn }) {
+  constructor({ ledger, adapter, shelf, warn, batchSize = 50 }) {
     this.ledger = ledger
     this.adapter = adapter
     this.shelf = shelf
     this.warn = warn
+    this.batchSize = batchSize
   }
 
   /**
@@ -338,14 +339,25 @@ export class MutationCoordinator {
    * Settle operations left pending, dispatched, or uncertain by a crash,
    * timeout, or plugin reload - by stable key, never by blind retry.
    *
-   * @returns {Promise<{checked: number, applied: number, conflicts: number, unresolved: number}>}
+   * One pass settles at most `limit` operations and `limit` cleanups, because
+   * each one costs a subprocess. A pass that fills either batch says so:
+   * `truncated` means "this batch hit its cap, run again", which is distinct
+   * from `remaining`, since an operation whose record is gone or tombstoned is
+   * counted as outstanding forever and can never be settled. Reporting only
+   * `remaining` would send a caller into an unwinnable loop.
+   *
+   * @returns {Promise<{checked: number, applied: number, conflicts: number,
+   *   unresolved: number, cleanups: number, remaining: number, truncated: boolean}>}
    */
-  async reconcile({ signal, limit = 50 } = {}) {
-    const summary = { checked: 0, applied: 0, conflicts: 0, unresolved: 0 }
+  async reconcile({ signal, limit = this.batchSize } = {}) {
+    const summary = {
+      checked: 0, applied: 0, conflicts: 0, unresolved: 0, cleanups: 0, remaining: 0, truncated: false,
+    }
 
     const due = new Set(this.ledger.dueRetries(limit).map((row) => row.operation_id))
 
-    for (const operation of this.ledger.pendingOperations(limit)) {
+    const operations = this.ledger.pendingOperations(limit)
+    for (const operation of operations) {
       summary.checked += 1
       const record = this.ledger.getRecord(operation.memory_id)
       if (!record) { summary.unresolved += 1; continue }
@@ -413,16 +425,22 @@ export class MutationCoordinator {
     }
 
     // Finish deletions whose CLI step never completed.
-    for (const tombstone of this.ledger.pendingCleanups(limit)) {
+    const cleanups = this.ledger.pendingCleanups(limit)
+    for (const tombstone of cleanups) {
       const record = this.ledger.getRecord(tombstone.memory_id)
       if (!record || record.state !== RecordState.TOMBSTONED) continue
       try {
         await this.forget({ memoryId: tombstone.memory_id, reason: 'reconcile', signal })
+        summary.cleanups += 1
       } catch (error) {
         this.warn(`reconcile could not clean up ${tombstone.memory_id}: ${error.message}`)
       }
     }
 
+    // Counted after the pass, against the same unjoined sets the batches page
+    // over, so `remaining` is what a further pass would actually see.
+    summary.remaining = this.ledger.countPendingOperations() + this.ledger.countPendingCleanups()
+    summary.truncated = operations.length >= limit || cleanups.length >= limit
     return summary
   }
 
