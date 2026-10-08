@@ -1,7 +1,8 @@
 {
   "name": "@tkliuxing/dsh-hypatia",
   "version": "0.2.0",
-  "description": "Long-term memory for DeepSeek Harness backed by Hypatia: a host-side CLI adapter, a plugin-owned SQLite control ledger, same-request recall, and narrow memory tools. Requires the `hypatia` CLI on PATH.",
+  "description": "DEPRECATED AND UNMAINTAINED - use dsh-hypatia-auto-memory instead. Long-term memory for DeepSeek Harness backed by Hypatia: a host-side CLI adapter, a plugin-owned SQLite control ledger, same-request recall, and narrow memory tools. Requires the `hypatia` CLI on PATH.",
+  "deprecated": "Deprecated and no longer maintained. Use dsh-hypatia-auto-memory instead: `dsh plugin --profile web remove @tkliuxing/dsh-hypatia`, then `dsh plugin --profile web add dsh-hypatia-auto-memory`. Install one or the other, never both. See DEPRECATION.md.",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
@@ -25,7 +26,8 @@
     "skills",
     "GOAL.md",
     "README.md",
-    "README.zh.md"
+    "README.zh.md",
+    "DEPRECATION.md"
   ],
   "scripts": {
     "test": "node --disable-warning=ExperimentalWarning --test 'tests/**/*.spec.js'",

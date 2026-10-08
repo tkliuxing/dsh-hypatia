@@ -2,6 +2,20 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⚠️ This project is deprecated
+
+Deprecated **2026-10-08**, last release `0.2.0`, no longer maintained: no fixes,
+no releases, no triage. The successor is
+[`dsh-hypatia-auto-memory`](https://github.com/tkliuxing/dsh-hypatia-auto-memory);
+see [DEPRECATION.md](./DEPRECATION.md) for migration and the data story.
+
+When working here: do not start feature work, do not "fix" the design decisions
+recorded in GOAL.md, and do not treat the invariants below as things to evolve —
+they describe frozen code. Changes are limited to keeping the deprecation itself
+accurate, or to a user's explicit, scoped request against `0.2.0` behaviour. Live
+deployments still run this plugin, which is the only reason `src/` is worth
+touching at all: keep the invariants true.
+
 ## What this is
 
 `dsh-hypatia` is a **DeepSeek Harness (DSH) plugin** — a cordis plugin published as plain ESM JavaScript with **no build step and no runtime dependencies**. It gives DSH sessions long-term memory backed by the external [hypatia](https://github.com/MarchLiu/hypatia) knowledge-graph CLI.
@@ -75,7 +89,7 @@ The harness is a sibling checkout at `../deepseek-harness` — **read it for API
 - `presentCall(args)` → a `ToolCallView` from `packages/core/tools/src/presentation.ts`, re-derived on every transcript read by `viewFor` in `packages/host/apiproxy/src/api-proxy.ts` and shipped as `{for: 'call', view}`. A presenter that *throws* soft-falls to no card; one that *returns* a bad object does not — see the `card` invariant above.
 - `ctx.on('session/event', (session, event) => ...)` — `compaction/summary` carries `shadowedSeqs` (authoritative) and `shadowedRange` (a surface-position span; see the invariant above). `session.events` holds what was logged before this plugin loaded.
 - `ctx.effect(fn, label)` is the teardown seam; `ctx.on('dispose')` is not a cordis event and never fires.
-- `source: {kind: 'plugin', plugin, form}` — `form: 'recall'` marks retrieved reference context; `'notice'` also needs a `summary`.
+- `source: {kind: 'plugin:<name>', plugin, form}` — the retired `{kind: 'plugin'}` wrapper is refused by format v4 admission; `form: 'recall'` marks retrieved reference context; `'notice'` also needs a `summary`.
 - Session header fields used for identity: `id`, `createdAt`, `cwd`, `parentSession`, `seedLength`, `origin`.
 
 ### Testing the wiring, not only the parts

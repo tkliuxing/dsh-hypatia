@@ -2,6 +2,25 @@
 
 [中文文档](./README.zh.md)
 
+> ## ⚠️ Deprecated — no longer maintained
+>
+> This project is deprecated as of **2026-10-08**. The last release is `0.2.0`;
+> there will be no further fixes or releases. Use
+> **[`dsh-hypatia-auto-memory`](https://github.com/tkliuxing/dsh-hypatia-auto-memory)**
+> instead — it drives the same Hypatia store from DSH native session events, so
+> writing memories no longer depends on the model choosing to call a tool.
+>
+> ```sh
+> dsh plugin --profile web remove @tkliuxing/dsh-hypatia
+> dsh plugin --profile web add dsh-hypatia-auto-memory
+> ```
+>
+> Install one or the other, **never both**: they share the `hypatia-memory` skill
+> name and the same shelves. Existing Hypatia entries need no migration. See
+> [DEPRECATION.md](./DEPRECATION.md) for the migration and rollback details.
+>
+> Everything below documents `0.2.0` and is kept as a historical record.
+
 Long-term memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), backed by the [Hypatia](https://github.com/MarchLiu/hypatia) knowledge graph.
 
 The plugin runs Hypatia itself, in host code. The model is not responsible for logging, database orchestration, permissions, retries, or deletion — it only proposes what is worth remembering.

@@ -1,6 +1,10 @@
 /**
  * dsh-hypatia - long-term memory for DeepSeek Harness, backed by Hypatia.
  *
+ * DEPRECATED as of 2026-10-08 and no longer maintained; the last release is
+ * 0.2.0. Use `dsh-hypatia-auto-memory` instead. See DEPRECATION.md. The code
+ * below is frozen: it still works, it simply receives no further fixes.
+ *
  * The plugin owns lifecycle integration, memory authorization, durable
  * operation state, scope derivation, provenance, recall budgets, validation,
  * retries, and observability. Hypatia stays an unmodified external semantic
@@ -65,6 +69,25 @@ export const inject = ['skills', 'agents']
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 const SKILLS_DIR = join(PLUGIN_DIR, 'skills')
 
+/**
+ * Load-time deprecation notice.
+ *
+ * Reported by `apply()` before every gate, for the same reason the
+ * removed-bridge notice is reported there: the deployments most in need of it -
+ * an empty policy, a host without the CLI - are exactly the ones that return
+ * early, and a notice placed after those gates would never reach them.
+ *
+ * It names the replacement and the exact commands because a user who never
+ * reads the README still has to end up on the maintained plugin, and because
+ * installing both is the failure mode that costs them: the two plugins register
+ * the same `hypatia-memory` skill and write the same shelves.
+ */
+const DEPRECATION_NOTICE = 'dsh-hypatia is deprecated and no longer maintained. '
+  + 'Use dsh-hypatia-auto-memory instead: `dsh plugin --profile web remove '
+  + '@tkliuxing/dsh-hypatia`, then `dsh plugin --profile web add '
+  + 'dsh-hypatia-auto-memory`, then restart dsh. Run one or the other, never both. '
+  + 'See DEPRECATION.md.'
+
 /** Best-effort logging that never breaks plugin load. */
 function makeWarn(ctx) {
   return (message) => {
@@ -103,7 +126,7 @@ function recallMessage(text) {
     id: randomUUID(),
     role: 'user',
     content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: name, form: 'recall' },
+    source: { kind: `plugin:${name}`, plugin: name, form: 'recall' },
   }
 }
 
@@ -114,6 +137,8 @@ function recallMessage(text) {
 export async function apply(ctx, rawConfig = {}) {
   const warn = makeWarn(ctx)
   const config = normalizeConfig(rawConfig)
+
+  warn(DEPRECATION_NOTICE)
 
   if (config.registerSkills) {
     try {

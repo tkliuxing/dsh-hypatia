@@ -2,6 +2,22 @@
 
 [English](./README.md)
 
+> ## ⚠️ 已废弃，不再维护
+>
+> 本项目自 **2026-10-08** 起废弃，最后一个版本是 `0.2.0`，不再修复也不再发布。请改用
+> **[`dsh-hypatia-auto-memory`](https://github.com/tkliuxing/dsh-hypatia-auto-memory)** ——
+> 它由 DSH 原生会话事件驱动写入同一套 Hypatia 存储，不再依赖模型主动调用工具。
+>
+> ```sh
+> dsh plugin --profile web remove @tkliuxing/dsh-hypatia
+> dsh plugin --profile web add dsh-hypatia-auto-memory
+> ```
+>
+> 两个插件**只能装一个**：它们共用 `hypatia-memory` 技能名和同一批 shelf。已有的 Hypatia
+> 记忆不需要迁移。迁移与回退细节见 [DEPRECATION.md](./DEPRECATION.md)。
+>
+> 以下内容描述的是 `0.2.0`，仅作历史记录保留。
+
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 提供长期记忆，底层是 [Hypatia](https://github.com/MarchLiu/hypatia) 知识图谱。
 
 插件在宿主进程内自行调用 Hypatia。模型不负责写日志、编排数据库、判断权限、重试或删除，它只负责判断**什么值得记住**。

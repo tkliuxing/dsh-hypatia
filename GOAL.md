@@ -1,5 +1,17 @@
 # dsh-hypatia Technical Goal
 
+> **DEPRECATED — 2026-10-08. This project is no longer maintained.**
+>
+> The architecture below was delivered through Phase 2 and is preserved as the
+> design record: what was built, and more usefully what was measured and refused.
+> It is **not a plan for future work** — nothing here will be implemented. Use
+> [`dsh-hypatia-auto-memory`](https://github.com/tkliuxing/dsh-hypatia-auto-memory)
+> instead; see [DEPRECATION.md](./DEPRECATION.md).
+>
+> Read the rest of this document as history rather than as binding instruction.
+> Where it says a thing "must" be done, that describes what the code written here
+> had to satisfy, not work someone is still expected to pick up.
+
 ## Status
 
 Architecture research is complete. This revision applies a hard repository boundary:

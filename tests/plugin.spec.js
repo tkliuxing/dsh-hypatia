@@ -241,7 +241,7 @@ describe('same-request recall wiring', { skip: hypatiaMissing() }, () => {
     await apply(ctx, { state: { dir: stateDir }, recall: { hypatiaSupplement: false } })
     const contextOnly = [{
       id: 'p1', role: 'user',
-      source: { kind: 'plugin', plugin: 'other', form: 'notice', summary: 'x' },
+      source: { kind: 'plugin:other', plugin: 'other', form: 'notice', summary: 'x' },
       content: [{ type: 'text', text: 'toolchain' }],
     }]
     const handler = ctx.handlers.get('agent/pre-step')[0]
@@ -416,5 +416,32 @@ describe('removed bridge configuration', () => {
 
     assert.equal(ctx.has('agent/turn-stopping'), false)
     assert.doesNotMatch(ctx.warnings.join('\n'), /legacyBridge/)
+  })
+})
+
+describe('deprecation notice', () => {
+  it('names the replacement on a path that returns early', async () => {
+    // Deprecated, not switched off: the plugin still loads and still works, so
+    // this notice is the whole mechanism that moves a deployment off it. It is
+    // asserted on the empty-policy path because that path returns before every
+    // other gate - a notice placed after them would miss exactly the
+    // deployment that needs it most.
+    const ctx = makeContext()
+    await apply(ctx, config({ memory: { preset: 'disabled' } }))
+
+    assert.match(ctx.warnings.join('\n'), /deprecated and no longer maintained/)
+    assert.match(ctx.warnings.join('\n'), /dsh-hypatia-auto-memory/)
+    // The two plugins register the same `hypatia-memory` skill and write the
+    // same shelves, so "remove this one first" is part of the instruction.
+    assert.match(ctx.warnings.join('\n'), /remove .*dsh-hypatia/)
+  })
+
+  it('names the replacement when memory is enabled as well', async () => {
+    // Deliberately not skipped where hypatia is absent: the notice precedes the
+    // adapter gate, so both the initialized and the degraded path must carry it.
+    const ctx = makeContext()
+    await apply(ctx, config())
+
+    assert.match(ctx.warnings.join('\n'), /deprecated and no longer maintained/)
   })
 })
