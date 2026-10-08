@@ -68,16 +68,19 @@ dsh plugin --profile web add /path/to/dsh-hypatia
 pnpm dsh plugin --profile web add /path/to/dsh-hypatia
 ```
 
-The published package is **`@tkliuxing/dsh-hypatia`**. The unscoped `dsh-hypatia`
-name on npm belongs to this project's pre-rewrite release and is not updated.
+The published package is **`@tkliuxing/dsh-hypatia`** — the only name this
+repository publishes.
 
-Upgrading from an install made under that old name? Remove it first, or the
-profile carries two entries for one plugin — and, because both resolve to the
-same code, the plugin can load twice against one ledger:
+The unscoped **`dsh-hypatia`** on npm is a *different project*: a bundled-skills
+plus auto-approve plugin by [MarchLiu](https://github.com/MarchLiu/hypatia), who
+also writes hypatia itself. It is not an earlier release of this one, and it is
+still updated. The two are unrelated codebases that happen to register the same
+`hypatia` and `hypatia-memory` skill names, so pick one deliberately — and do
+not uninstall the unscoped package as if it were ours:
 
 ```sh
-dsh plugin --profile web remove dsh-hypatia
-dsh plugin --profile web add @tkliuxing/dsh-hypatia
+# uninstalling this plugin means this name, and only this name
+dsh plugin --profile web remove @tkliuxing/dsh-hypatia
 ```
 
 **Restart dsh** after installing or after editing `index.js`, `src/`, or `skills/`.

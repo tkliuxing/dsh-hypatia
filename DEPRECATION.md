@@ -26,14 +26,15 @@ a dedicated model route. Its README is the authority on its own behaviour.
 # 1. remove this plugin from the profile
 dsh plugin --profile web remove @tkliuxing/dsh-hypatia
 
-# ...or, if it was installed under the old unscoped name
-dsh plugin --profile web remove dsh-hypatia
-
 # 2. install the replacement
 dsh plugin --profile web add dsh-hypatia-auto-memory
 
 # 3. restart dsh - plugin wiring happens once, at load
 ```
+
+Mind the name: the unscoped `dsh-hypatia` on npm is a **different plugin**, by
+MarchLiu (who writes hypatia itself), not an earlier release of this one. Leave
+it alone — only the scoped `@tkliuxing/dsh-hypatia` is this project.
 
 **Run one or the other, never both.** They both register a `hypatia-memory` skill
 and both write to the same shelves; installed together, one silently loses the
@@ -74,6 +75,10 @@ dsh plugin --profile web remove @tkliuxing/dsh-hypatia
 dsh plugin --profile web add dsh-hypatia-auto-memory
 # 然后重启 dsh
 ```
+
+注意包名：npm 上未加 scope 的 `dsh-hypatia` 是**另一个插件**（hypatia 作者 MarchLiu
+的项目），不是本项目的早期版本，不要顺手卸掉它 —— 本项目只有
+`@tkliuxing/dsh-hypatia` 这一个名字。
 
 两个插件**只能装一个**：它们都注册 `hypatia-memory` 技能、都写同一批 shelf，同时安装会
 导致技能注册被其中一个顶掉，同一段对话还可能被写两遍。

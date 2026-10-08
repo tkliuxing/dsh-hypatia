@@ -65,15 +65,17 @@ dsh plugin --profile web add /path/to/dsh-hypatia
 pnpm dsh plugin --profile web add /path/to/dsh-hypatia
 ```
 
-发布的包名是 **`@tkliuxing/dsh-hypatia`**。npm 上未加 scope 的 `dsh-hypatia`
-属于本项目重写之前的版本，不再更新。
+发布的包名是 **`@tkliuxing/dsh-hypatia`** —— 本仓库只发布这一个名字。
 
-如果之前是按旧包名装的，先移除再安装，否则 profile 里会留下同一个插件的两条记录 ——
-而且两条都指向同一份代码，插件可能对着同一个账本被加载两次：
+npm 上未加 scope 的 **`dsh-hypatia`** 是**另一个项目**：由 hypatia 的作者
+[MarchLiu](https://github.com/MarchLiu/hypatia) 维护的「内置 skills + 自动授权」插件。
+它不是本项目的早期版本，至今仍在更新。两者是互不相关的代码，只是恰好注册了同名的
+`hypatia` 与 `hypatia-memory` 技能，所以要自行选定其一 —— 卸载本插件时不要顺手把未加
+scope 的那个包也卸了：
 
 ```sh
-dsh plugin --profile web remove dsh-hypatia
-dsh plugin --profile web add @tkliuxing/dsh-hypatia
+# 卸载本插件，指的只是这个名字
+dsh plugin --profile web remove @tkliuxing/dsh-hypatia
 ```
 
 安装后、以及修改 `index.js`、`src/`、`skills/` 后，都需要**重启 dsh**。
